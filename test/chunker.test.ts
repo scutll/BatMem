@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { chunkMarkdown } from "../src/chunker.ts";
+import { chunkMarkdown } from "../src/rag/chunker.ts";
 
 describe("Markdown chunking", () => {
 	it("returns no chunks for an empty document", () => {

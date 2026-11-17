@@ -2,50 +2,47 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, open, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { openDatabase } from "../../src/db.ts";
-import { RAGService } from "../../src/rag.ts";
-import type { CorpusRecord, DatasetLoader, EvaluationQuery } from "./dataset.ts";
+import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
+import { BM25Retriever } from "../../src/search/bm25.ts";
+import { SearchService } from "../../src/search/service.ts";
+import { VectorRetriever } from "../../src/search/vector.ts";
+import type { RetrievalHit, RetrievalQuery } from "../../src/search/types.ts";
+import { VectorIndex } from "../../src/embedding/vector-index.ts";
+import { fingerprintCorpus, prepareCorpusBuild } from "./build.ts";
+import type { DatasetLoader, EvaluationQuery } from "./dataset.ts";
+import { Progress } from "./progress.ts";
+
+export { indexCorpus } from "./build.ts";
 
 /** One corpus row becomes one indexed chunk. No Markdown scanning or chunking is performed. */
 export interface RetrievalEvalOptions {
 	loader: DatasetLoader;
 	/** New directory, created exclusively; existing experiment files are never overwritten. */
 	output: string;
+	/** Shared build root. Omit for an isolated database inside output (e.g. in-memory adapter tests). */
+	builds?: string;
 	topK?: number;
+	mode?: "search" | "vsearch";
+	embedding?: EmbeddingProvider;
 }
 
-/** Index prepared retrieval units through the production writer; reject duplicate source IDs. */
-export async function indexCorpus(rag: RAGService, corpus: AsyncIterable<CorpusRecord>): Promise<Set<string>> {
-	const ids = new Set<string>();
-	for await (const record of corpus) {
-		if (ids.has(record.id)) throw new Error(`Duplicate corpus ID: ${record.id}`);
-		ids.add(record.id);
-		const text = record.text;
-		rag.replaceDocumentIndex(
-			{
-				id: record.id,
-				// Logical source only: corpus records need not exist as separate files.
-				sourcePath: `dataset:${record.id}`,
-				contentHash: createHash("sha256").update(text).digest("hex"),
-				modifiedAt: new Date(0).toISOString(),
-			},
-			[{ text, chunkIndex: 0, startLine: 1, endLine: Math.max(1, text.replace(/\n$/, "").split("\n").length) }],
-		);
-	}
-	return ids;
-}
+/** Export consumes ordered hits only; dataset formats and retrieval strategies stay outside this contract. */
+export type RetrievalFunction = (request: RetrievalQuery) => Promise<RetrievalHit[]>;
 
-/** Export every judged query in input order, including empty rankings; preserve native BM25 order. */
+/** Export every judged query in input order, including empty rankings; preserve retriever order. */
 export async function exportResults(
-	rag: RAGService,
+	retrieve: RetrievalFunction,
 	queries: EvaluationQuery[],
 	topK: number,
 	resultPath: string,
 ): Promise<void> {
 	const file = await open(resultPath, "wx");
+	const progress = new Progress("批量查询");
+	let completed = 0;
 	try {
 		for (const query of queries) {
-			const hits = rag.searchChunks({ query: query.text, topK });
+			progress.update(`${completed + 1}/${queries.length} 正在检索`);
+			const hits = await retrieve({ query: query.text, topK });
 			await file.write(
 				`${JSON.stringify({
 					query_id: query.id,
@@ -60,22 +57,29 @@ export async function exportResults(
 					qrels: query.qrels,
 				})}\n`,
 			);
+			progress.update(`${++completed}/${queries.length} 已完成`);
 		}
 	} finally {
+		progress.finish(`${completed}/${queries.length} 已导出`);
 		await file.close();
 	}
 }
 
 /**
- * Build a fresh isolated database, retrieve all judged queries and export ranked JSONL plus a manifest.
+ * Build or reuse the corpus index, then export an independent run with ranked JSONL and a manifest.
  * Errors abort the run; the manifest is written last and marks a complete export. Partial artifacts remain
  * for diagnosis. The production query preparation, BM25 ranking and FTS triggers are reused unchanged.
  */
 export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<void> {
 	const topK = options.topK ?? 10;
+	const mode = options.mode ?? "search";
+	if (mode !== "search" && mode !== "vsearch") throw new Error("Unknown retrieval mode.");
+	if (mode === "vsearch" && !options.embedding) throw new Error("vsearch requires an embedding provider.");
 	const loader = options.loader;
 	if (!Number.isSafeInteger(topK) || topK < 1) throw new Error("topK must be a positive integer.");
 	const output = resolve(options.output);
+	console.info(`[评测] 模式：${mode}；Top-K：${topK}；输出：${output}`);
+	console.info("[查询集] 读取 Query / Qrels");
 	const queries = await loader.loadQueries();
 	if (!queries.length) throw new Error("No evaluation queries.");
 	const queryIds = new Set<string>();
@@ -85,17 +89,57 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 	}
 	await mkdir(dirname(output), { recursive: true });
 	await mkdir(output, { recursive: false });
-	const db = openDatabase(join(output, "index.db"));
+	const corpus = await fingerprintCorpus(loader);
+	const buildDirectory = options.builds ? join(resolve(options.builds), corpus.fingerprint) : output;
+	const build = await prepareCorpusBuild(loader, buildDirectory, corpus.fingerprint, corpus.count);
+	const db = build.db;
 	try {
-		const rag = new RAGService(db, output);
-		const ids = await indexCorpus(rag, loader.readCorpus());
-		if (!ids.size) throw new Error("Empty corpus.");
+		const hasDocument = db.prepare("SELECT 1 FROM documents WHERE id = ?");
 		for (const query of queries) {
 			for (const id of Object.keys(query.qrels)) {
-				if (!ids.has(id)) throw new Error(`Qrel references missing corpus ID: ${id}`);
+				if (!hasDocument.get(id)) throw new Error(`Qrel references missing corpus ID: ${id}`);
 			}
 		}
-		await exportResults(rag, queries, topK, join(output, "retrieval.jsonl"));
+		const vectors = mode === "vsearch" && options.embedding ? new VectorIndex(db, options.embedding) : undefined;
+		if (vectors) {
+			console.info(`[Embedding 模型] ${options.embedding!.identity}`);
+			vectors.initialize();
+			const status = vectors.getStatus("document");
+			console.info(`[向量索引] 已有 ${status.indexed}/${status.total}；待生成 ${status.pending}`);
+			if (status.pending) {
+				const progress = new Progress("构建 Embedding");
+				progress.update(`${status.indexed}/${status.total}；正在请求模型`);
+				try {
+					await vectors.syncEmbeddings("document", (current) => {
+						progress.update(`${current.indexed}/${current.total}；剩余 ${current.pending}`);
+					});
+				} finally {
+					const current = vectors.getStatus("document");
+					progress.finish(`${current.indexed}/${current.total} 已保存；剩余 ${current.pending}`);
+				}
+			} else console.info("[向量索引] 完整复用，无需调用文档 embedding 模型");
+			vectors.assertReady("document", options.embedding!);
+			await writeFile(
+				join(buildDirectory, "build-manifest.json"),
+				JSON.stringify(
+					{
+						status: "vector-ready",
+						corpus_fingerprint: build.fingerprint,
+						corpus_count: build.count,
+						index_path: build.path,
+						embedding: { identity: options.embedding!.identity, dimensions: options.embedding!.dimensions },
+						vector_status: vectors.getStatus("document"),
+					},
+					null,
+					2,
+				),
+			);
+		}
+		const search = new SearchService(
+			new BM25Retriever(db, "document"),
+			vectors && options.embedding ? new VectorRetriever(vectors, options.embedding, "document") : undefined,
+		);
+		await exportResults(search[mode].bind(search), queries, topK, join(output, "retrieval.jsonl"));
 		const hashes: Record<string, string> = {};
 		for (const path of loader.sourceFiles) {
 			const hash = createHash("sha256");
@@ -104,9 +148,25 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 		}
 		// Fingerprint executable retrieval sources as well as data, including uncommitted changes.
 		const implementationHashes: Record<string, string> = {};
-		const implementations = ["../../src/db.ts", "../../src/rag.ts", "./dataset.ts", "./runner.ts"].map(
-			(name) => new URL(name, import.meta.url),
-		);
+		const implementations = [
+			"../../src/storage/db.ts",
+			"../../src/rag/service.ts",
+			"../../src/rag/chunker.ts",
+			"../../src/rag/types.ts",
+			"../../src/embedding/provider.ts",
+			"../../src/embedding/jina.ts",
+			"../../src/embedding/vector-index.ts",
+			"../../src/search/types.ts",
+			"../../src/search/bm25.ts",
+			"../../src/search/vector.ts",
+			"../../src/search/service.ts",
+			"../../src/search/rows.ts",
+			"./dataset.ts",
+			"./runner.ts",
+			"./build.ts",
+			"./progress.ts",
+			"../../src/config.ts",
+		].map((name) => new URL(name, import.meta.url));
 		for (const path of [...implementations, ...loader.implementationFiles]) {
 			const hash = createHash("sha256");
 			for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -120,20 +180,32 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 					dataset: loader.name,
 					split: loader.split,
 					top_k: topK,
-					corpus_count: ids.size,
+					corpus_count: build.count,
+					build: {
+						directory: buildDirectory,
+						index_path: build.path,
+						fingerprint: build.fingerprint,
+						reused: build.reused,
+					},
 					query_count: queries.length,
 					input_sha256: hashes,
 					implementation_sha256: implementationHashes,
 					node_version: process.version,
 					sqlite_version: db.prepare("SELECT sqlite_version() AS version").get()?.version,
-					retriever: "SQLite FTS5 default tokenizer; quoted OR terms; native BM25 ascending",
+					retriever: mode,
+					score: mode === "search" ? "negated SQLite BM25; descending" : "cosine similarity; descending",
+					embedding: vectors
+						? { identity: options.embedding!.identity, dimensions: options.embedding!.dimensions }
+						: undefined,
+					vector_status: vectors?.getStatus("document"),
 					indexing: loader.indexing,
 				},
 				null,
 				2,
 			),
 		);
+		console.info(`[评测完成] ${queries.length} 条查询；结果：${join(output, "retrieval.jsonl")}`);
 	} finally {
-		db.close();
+		build.close();
 	}
 }

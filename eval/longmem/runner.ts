@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { clearLine, cursorTo } from "node:readline";
-import { openDatabase } from "../../src/db.ts";
-import { MemoryService } from "../../src/memory.ts";
-import type { SummaryGenerator } from "../../src/types.ts";
+import { openDatabase } from "../../src/storage/db.ts";
+import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
+import { MemoryService } from "../../src/memory/service.ts";
+import type { SummaryGenerator } from "../../src/memory/types.ts";
+import { VectorIndex } from "../../src/embedding/vector-index.ts";
 import type { MemoryDatasetLoader, MemorySample } from "./dataset.ts";
 import type { QuestionResult, TraceEvent } from "./pi.ts";
 import type { ImportedSession } from "./sessions.ts";
@@ -48,12 +50,14 @@ export interface MemoryBuildManifest {
 /** Bump only when persisted Session/SQLite/summary-input formats become incompatible with existing builds. */
 const BUILD_FORMAT = 1;
 
-/** A run points to a build cache and owns only its answer and Judge artifacts. */
+/** A run points to a build cache and owns its answer artifacts and disposable SQLite copies. */
 export interface EvaluationRunManifest {
 	status: "prepared";
 	buildDirectory: string;
 	buildFingerprint: string;
 	sampleDirectories: string[];
+	retrieval?: "search" | "vsearch";
+	embedding?: { identity: string; dimensions: number };
 }
 
 export interface PreparedBuild {
@@ -85,9 +89,18 @@ async function collectCodeHashes(): Promise<Record<string, string>> {
 		"./dataset.ts",
 		"./longmemeval.ts",
 		"./sessions.ts",
-		"../../src/db.ts",
-		"../../src/memory.ts",
-		"../../src/summary.ts",
+		"../../src/storage/db.ts",
+		"../../src/memory/service.ts",
+		"../../src/memory/types.ts",
+		"../../src/memory/summary.ts",
+		"../../src/embedding/provider.ts",
+		"../../src/embedding/jina.ts",
+		"../../src/embedding/vector-index.ts",
+		"../../src/search/types.ts",
+		"../../src/search/bm25.ts",
+		"../../src/search/vector.ts",
+		"../../src/search/service.ts",
+		"../../src/search/rows.ts",
 	])
 		hashes[name] = await sha256File(new URL(name, import.meta.url));
 	return hashes;
@@ -130,8 +143,12 @@ async function findCompatibleBuild(
 }
 
 function normalizeSelection(selection: BuildSelection): BuildSelection {
-	if (!Number.isSafeInteger(selection.limit) || selection.limit < 1) throw new Error("limit must be a positive integer.");
-	return { limit: selection.limit, types: [...new Set(selection.types.map((type) => type.trim()).filter(Boolean))].sort() };
+	if (!Number.isSafeInteger(selection.limit) || selection.limit < 1)
+		throw new Error("limit must be a positive integer.");
+	return {
+		limit: selection.limit,
+		types: [...new Set(selection.types.map((type) => type.trim()).filter(Boolean))].sort(),
+	};
 }
 
 /**
@@ -194,13 +211,16 @@ export async function prepareBuild(
 		}
 		for (const [index, relativeDirectory] of existing.sampleDirectories.entries()) {
 			const prepared = await loadPreparedSample(directory, relativeDirectory);
-			if (prepared.sample.id !== selected[index]?.id) throw new Error("Cached build sample order does not match dataset.");
+			if (prepared.sample.id !== selected[index]?.id)
+				throw new Error("Cached build sample order does not match dataset.");
 		}
 		if (existing.sampleDirectories.length === selected.length) {
 			console.info(`[prepare] 复用已有 build：${fingerprint}`);
 			return { directory, manifest: existing, sampleDirectories: existing.sampleDirectories };
 		}
-		console.info(`[prepare] 扩展已有 build：${fingerprint}；新增 ${selected.length - existing.sampleDirectories.length} 题`);
+		console.info(
+			`[prepare] 扩展已有 build：${fingerprint}；新增 ${selected.length - existing.sampleDirectories.length} 题`,
+		);
 		const existingCount = existing.sampleDirectories.length;
 		const sampleDirectories = [...existing.sampleDirectories];
 		for (const [index, sample] of selected.slice(existingCount).entries()) {
@@ -208,11 +228,14 @@ export async function prepareBuild(
 			const relativeDirectory = join("samples", String(position).padStart(4, "0"));
 			try {
 				const prepared = await loadPreparedSample(directory, relativeDirectory);
-				if (prepared.sample.id !== sample.id) throw new Error("Unregistered cache sample does not match dataset order.");
+				if (prepared.sample.id !== sample.id)
+					throw new Error("Unregistered cache sample does not match dataset order.");
 				console.info(`[prepare ${position}/${selected.length}] ${sample.id}：恢复上次中断前已生成的样本`);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				console.info(`[prepare ${position}/${selected.length}] ${sample.id}：生成 ${sample.histories.length} 个历史 Session`);
+				console.info(
+					`[prepare ${position}/${selected.length}] ${sample.id}：生成 ${sample.histories.length} 个历史 Session`,
+				);
 				await prepareSample(sample, join(directory, relativeDirectory));
 			}
 			sampleDirectories.push(relativeDirectory);
@@ -233,7 +256,9 @@ export async function prepareBuild(
 	console.info(`[prepare] 生成 ${selected.length} 道题的 build：${fingerprint}`);
 	for (const [index, sample] of selected.entries()) {
 		const relativeDirectory = join("samples", String(index + 1).padStart(4, "0"));
-		console.info(`[prepare ${index + 1}/${selected.length}] ${sample.id}：生成 ${sample.histories.length} 个历史 Session`);
+		console.info(
+			`[prepare ${index + 1}/${selected.length}] ${sample.id}：生成 ${sample.histories.length} 个历史 Session`,
+		);
 		await prepareSample(sample, join(directory, relativeDirectory));
 		sampleDirectories.push(relativeDirectory);
 	}
@@ -255,7 +280,13 @@ export async function prepareBuild(
 }
 
 /** Create a disposable evaluation run that references, but never owns, cached history or SQLite data. */
-export async function createEvaluationRun(output: string, build: PreparedBuild): Promise<EvaluationRunManifest> {
+export async function createEvaluationRun(
+	output: string,
+	build: PreparedBuild,
+	retrieval: "search" | "vsearch" = "search",
+	embedding?: EmbeddingProvider,
+): Promise<EvaluationRunManifest> {
+	if (retrieval === "vsearch" && !embedding) throw new Error("vsearch requires an embedding provider.");
 	const root = resolve(output);
 	await mkdir(dirname(root), { recursive: true });
 	await mkdir(root);
@@ -264,6 +295,8 @@ export async function createEvaluationRun(output: string, build: PreparedBuild):
 		buildDirectory: build.directory,
 		buildFingerprint: build.manifest.fingerprint,
 		sampleDirectories: build.sampleDirectories,
+		retrieval,
+		embedding: embedding ? { identity: embedding.identity, dimensions: embedding.dimensions } : undefined,
 	};
 	await writeFile(join(root, "run-manifest.json"), JSON.stringify(manifest, null, 2), { flag: "wx" });
 	return manifest;
@@ -303,6 +336,37 @@ export async function prepareMemoryBuild(prepared: PreparedSample, config: strin
 	return true;
 }
 
+/** Remove answer sessions left by older evaluations while preserving imported history and its vectors. */
+export function reconcileMemoryBuild(prepared: PreparedSample, repair: boolean): number {
+	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
+	try {
+		const expected = new Set(prepared.sessions.map((session) => session.sessionId));
+		const actual = new Set(db.prepare("SELECT id FROM sessions").all().map((row) => String(row.id)));
+		const missing = [...expected].filter((id) => !actual.has(id));
+		if (missing.length) throw new Error(`Memory build is missing ${missing.length} imported sessions: ${prepared.sample.id}`);
+		const summarized = new Set(db.prepare("SELECT session_id FROM summaries").all().map((row) => String(row.session_id)));
+		const unsummarized = [...expected].filter((id) => !summarized.has(id));
+		if (unsummarized.length)
+			throw new Error(`Memory build is missing ${unsummarized.length} historical summaries: ${prepared.sample.id}`);
+		const extra = [...actual].filter((id) => !expected.has(id));
+		if (!extra.length) return 0;
+		if (!repair) throw new Error(`Memory build contains ${extra.length} non-history sessions: ${prepared.sample.id}`);
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			const remove = db.prepare("DELETE FROM sessions WHERE id = ?");
+			for (const id of extra) remove.run(id);
+			db.exec("COMMIT");
+		} catch (error) {
+			db.exec("ROLLBACK");
+			throw error;
+		}
+		console.info(`[build ${prepared.sample.id}] 清理 ${extra.length} 个旧评测问答 Session`);
+		return extra.length;
+	} finally {
+		db.close();
+	}
+}
+
 /** Index each imported session once. Generation failures prevent publication of the ready marker. */
 export async function buildMemory(prepared: PreparedSample, generateSummary: SummaryGenerator): Promise<void> {
 	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
@@ -316,7 +380,9 @@ export async function buildMemory(prepared: PreparedSample, generateSummary: Sum
 				const progress = `[build ${prepared.sample.id}] Session ${index + 1}/${prepared.sessions.length} | ${imported.messageCount} msgs | syncing`;
 				process.stdout.write(progress.slice(0, Math.max(1, (process.stdout.columns ?? 80) - 1)));
 			}
-			const digest = createHash("sha256").update(await readFile(imported.path)).digest("hex");
+			const digest = createHash("sha256")
+				.update(await readFile(imported.path))
+				.digest("hex");
 			if (digest !== imported.sha256) throw new Error("History file changed since preparation.");
 			const snapshot = loadSessionSnapshot(imported.path);
 			if (snapshot.entries.length !== imported.messageCount) throw new Error("History changed since preparation.");
@@ -335,7 +401,50 @@ export async function buildMemory(prepared: PreparedSample, generateSummary: Sum
 		}
 		db.close();
 	}
-	console.info(`[build ${prepared.sample.id}] ${prepared.sessions.length} 条摘要已就绪，耗时 ${((Date.now() - start) / 1000).toFixed(1)}s`);
+	console.info(
+		`[build ${prepared.sample.id}] ${prepared.sessions.length} 条摘要已就绪，耗时 ${((Date.now() - start) / 1000).toFixed(1)}s`,
+	);
+}
+
+/** Complete missing vectors in a reusable summary database without rerunning the summary model. */
+export async function buildMemoryVectors(prepared: PreparedSample, embedding: EmbeddingProvider): Promise<void> {
+	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
+	try {
+		const index = new VectorIndex(db, embedding);
+		index.initialize();
+		const before = index.getStatus("memory");
+		console.info(`[vector ${prepared.sample.id}] 已有 ${before.indexed}/${before.total}；待生成 ${before.pending}`);
+		const memory = new MemoryService(db, embedding);
+		const started = Date.now();
+		let lastLog = 0;
+		const timer = setInterval(() => {
+			const status = index.getStatus("memory");
+			const line = `[vector ${prepared.sample.id}] ${status.indexed}/${status.total}；剩余 ${status.pending}；耗时 ${((Date.now() - started) / 1000).toFixed(1)}s`;
+			if (process.stdout.isTTY) {
+				cursorTo(process.stdout, 0);
+				clearLine(process.stdout, 0);
+				process.stdout.write(line.slice(0, Math.max(1, (process.stdout.columns ?? 80) - 1)));
+			} else if (Date.now() - lastLog >= 10_000) {
+				console.info(line);
+				lastLog = Date.now();
+			}
+		}, 1000);
+		timer.unref();
+		try {
+			await memory.ready;
+		} finally {
+			clearInterval(timer);
+			if (process.stdout.isTTY) {
+				cursorTo(process.stdout, 0);
+				clearLine(process.stdout, 0);
+			}
+		}
+		index.assertReady("memory", embedding);
+		const after = index.getStatus("memory");
+		console.info(`[vector ${prepared.sample.id}] ${after.indexed}/${after.total} 条摘要向量已就绪`);
+	} finally {
+		db.close();
+	}
 }
 
 export interface AnswerRequest {
@@ -346,61 +455,20 @@ export interface AnswerRequest {
 	trace: TraceEvent[];
 }
 
-/** The run owns ephemeral Pi files; the build project stays the Extension cwd that locates memory. */
+/** The run owns Pi files and a disposable copy of the indexed project. */
 export type AnswerQuestion = (request: AnswerRequest) => Promise<QuestionResult>;
 
-/**
- * Pi synchronizes the new question at agent_end, temporarily modifying the build database. Snapshot
- * and restore keeps that session out of the reusable cache. A lock prevents concurrent runs sharing it.
- */
-async function answerWithRestoredBuildDatabase<T>(prepared: PreparedSample, runtimeDirectory: string, action: () => Promise<T>): Promise<T> {
-	const dbPath = join(prepared.project, ".pi", "docs-memory", "index.db");
-	const lockPath = join(prepared.directory, ".answer.lock");
-	const backupDirectory = join(runtimeDirectory, ".memory-backup");
-	try {
-		await writeFile(lockPath, runtimeDirectory, { flag: "wx" });
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST")
-			throw new Error(`Another answer process is using build sample ${prepared.sample.id}.`);
-		throw error;
-	}
-	try {
-		await mkdir(backupDirectory, { recursive: true });
-		for (const suffix of ["", "-wal", "-shm"]) {
-			try {
-				await copyFile(`${dbPath}${suffix}`, join(backupDirectory, `index.db${suffix}`));
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-		}
-		try {
-			return await action();
-		} finally {
-			for (const suffix of ["", "-wal", "-shm"]) await rm(`${dbPath}${suffix}`, { force: true });
-			for (const suffix of ["", "-wal", "-shm"]) {
-				const backupPath = join(backupDirectory, `index.db${suffix}`);
-				try {
-					await copyFile(backupPath, `${dbPath}${suffix}`);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-			}
-		}
-	} finally {
-		await rm(backupDirectory, { recursive: true, force: true });
-		await unlink(lockPath).catch((error: unknown) => {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		});
-	}
-}
-
-/** Execute fresh Agent questions. Results live in run/, while the Pi cwd is the matching build project. */
+/** Execute fresh Agent questions against a run-local copy, leaving the reusable build untouched. */
 export async function runMemoryEval(
 	runDirectory: string,
 	build: PreparedBuild,
 	answer: AnswerQuestion,
 	mode: "memory" | "no-memory" = "memory",
+	retrieval: "search" | "vsearch" = "search",
+	embedding?: EmbeddingProvider,
 ): Promise<void> {
+	if (mode === "memory" && retrieval === "vsearch" && !embedding)
+		throw new Error("vsearch requires an embedding provider.");
 	const root = resolve(runDirectory);
 	const answersPath = join(root, `answers-${mode}.jsonl`);
 	await writeFile(answersPath, "", { flag: "wx" });
@@ -413,27 +481,62 @@ export async function runMemoryEval(
 		await mkdir(runtimeDirectory, { recursive: true });
 		const trace: TraceEvent[] = [];
 		const start = Date.now();
-		console.info(`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id}：创建 Pi 会话并等待回答`);
+		console.info(
+			`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id}：创建 Pi 会话并等待回答`,
+		);
 		try {
 			if (mode === "memory") await readFile(join(prepared.directory, "memory-ready.json"));
+			const project = mode === "memory" ? join(runtimeDirectory, "project") : prepared.project;
+			if (mode === "memory") {
+				const source = join(prepared.project, ".pi", "docs-memory", "index.db");
+				const targetDirectory = join(project, ".pi", "docs-memory");
+				await mkdir(targetDirectory, { recursive: true });
+				// SQLite may retain committed pages in WAL; keep the three files together in the run.
+				for (const suffix of ["", "-wal", "-shm"]) {
+					try {
+						await copyFile(`${source}${suffix}`, join(targetDirectory, `index.db${suffix}`));
+					} catch (error) {
+						if (!suffix || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					}
+				}
+				reconcileMemoryBuild({ ...prepared, project }, false);
+			}
+			if (mode === "memory" && retrieval === "vsearch" && embedding) {
+				const db = openDatabase(join(project, ".pi", "docs-memory", "index.db"));
+				try {
+					new VectorIndex(db, embedding).assertReady("memory", embedding);
+				} finally {
+					db.close();
+				}
+			}
 			const request: AnswerRequest = {
-				project: prepared.project,
+				project,
 				runtimeDirectory,
 				question: prepared.sample.question,
 				date: prepared.sample.date,
 				trace,
 			};
-			const result = mode === "memory" ? await answerWithRestoredBuildDatabase(prepared, runtimeDirectory, () => answer(request)) : await answer(request);
+			const result = await answer(request);
 			if (!result.text.trim()) throw new Error("Empty hypothesis.");
 			await writeFile(join(runtimeDirectory, `answer-${mode}.json`), JSON.stringify(result, null, 2));
-			await appendFile(answersPath, `${JSON.stringify({ question_id: prepared.sample.id, hypothesis: result.text })}\n`);
-			console.info(`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 已保存，耗时 ${((Date.now() - start) / 1000).toFixed(1)}s`);
+			await appendFile(
+				answersPath,
+				`${JSON.stringify({ question_id: prepared.sample.id, hypothesis: result.text })}\n`,
+			);
+			console.info(
+				`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 已保存，耗时 ${((Date.now() - start) / 1000).toFixed(1)}s`,
+			);
 		} catch (error) {
 			failed++;
-			console.error(`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 失败：${String(error)}`);
+			console.error(
+				`[answer ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 失败：${String(error)}`,
+			);
 			await appendFile(failuresPath, `${JSON.stringify({ question_id: prepared.sample.id, error: String(error) })}\n`);
 		} finally {
-			await writeFile(join(runtimeDirectory, `trace-${mode}.jsonl`), trace.map((event) => JSON.stringify(event)).join("\n"));
+			await writeFile(
+				join(runtimeDirectory, `trace-${mode}.jsonl`),
+				trace.map((event) => JSON.stringify(event)).join("\n"),
+			);
 		}
 	}
 	console.info(`[answer] 完成：成功 ${build.sampleDirectories.length - failed}，失败 ${failed}；回答：${answersPath}`);

@@ -63,6 +63,7 @@ it("validates answer completeness before any Judge call and aggregates judgments
 		assert.equal(calls, 1);
 		const metrics = JSON.parse(await readFile(join(run, "metrics-memory.json"), "utf8"));
 		assert.equal(metrics.overall_accuracy, 1);
+		assert.equal(metrics.retrieval, "search");
 		assert.deepEqual(metrics.judge_models, ["mock-deepseek"]);
 		const base = { question_id: "q", response: { text: "yes", model: "mock", usage: {} } };
 		const grouped = summarizeJudgments([

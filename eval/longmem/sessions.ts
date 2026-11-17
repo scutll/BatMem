@@ -14,7 +14,7 @@ import {
 	type FileEntry,
 	type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { SessionSnapshot } from "../../src/types.ts";
+import type { SessionSnapshot } from "../../src/memory/types.ts";
 import type { HistorySession } from "./dataset.ts";
 
 /** Dataset dates lack a timezone. Interpret wall times as UTC for stable arithmetic, not as a claim about locale. */

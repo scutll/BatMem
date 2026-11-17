@@ -1,55 +1,49 @@
-# Test-first contract
+# Test contract
 
-These tests specify the service implementation. All 29 cases run against the
-production chunker and temporary SQLite databases. No tests are skipped and no
-production behavior is mocked except the summary model call. The three test
-files cover underlying services, not real provider calls or the interactive UI.
+这些测试约束 BatMem 的当前服务接口。测试使用临时目录、真实 SQLite/FTS5 和真实
+sqlite-vec 查询；摘要与 embedding 响应使用固定 Mock，不读取真实 Session 文件、API
+密钥，也不发起模型请求。
 
-Run from this directory's parent (`.pi/extensions/BatMem`):
+从 BatMem 根目录运行：
 
-```sh
-node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts
+```powershell
+node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts
 ```
 
-## Public contracts
+## 公共接口
 
-- `openDatabase(path)` returns a synchronous `node:sqlite` database connection,
-  creates parent directories and initializes tables and FTS5 indexes.
-- `new MemoryService(db)` exposes `syncSession(snapshot, summarize)`,
-  `searchSummaries(query)`, and `readMessages(sessionId, keyword)`.
-- A snapshot contains `sessionId`, `sourcePath`, `projectPath`, and `entries`.
-  Entries use the existing session entry format. Each session is one linear
-  conversation; branch selection and ancestor lookup are out of scope.
-- `summarize(text)` returns `Promise<string>`. Its text includes either the full
-  conversation or the previous summary followed by new messages after the saved entry.
-- `new RAGService(db, documentsDirectory)` exposes asynchronous `scanDocuments()` and
-  synchronous `searchChunks(query)`.
-- Searches accept `{ query, topK }`. Empty input returns no results; user input is treated as text,
-  not trusted FTS syntax. Both services return ascending native BM25 scores.
-- Search hits contain `text`, `score`, `sourceType` (`memory` or `document`),
-  `sourceId`, and `location`. Memory locations contain `entryId` (summary leaf)
-  and `sourcePath`. Document locations contain `sourcePath`, `startLine`,
-  `endLine`, and zero-based `chunkIndex`. Line numbers are one-based and inclusive;
-  a trailing newline does not create an extra covered line.
-- `memory.readMessages()` returns messages containing `entryId`, `role`, `text`,
-  `timestamp`, and `sourcePath`, newest first. Keywords are literal substrings.
-- Chunking stops once a chunk reaches the end, without emitting a redundant
-  overlap-only chunk. Tests use ASCII to isolate chunk boundaries from future
-  Unicode character-counting choices.
-- `chunkMarkdown(text)` returns chunks with `text`, `chunkIndex`, `startLine`,
-  `endLine`, and `section`. Section is the active heading title at the chunk's
-  start, or the first heading when a chunk starts with that heading. Fenced code
-  does not introduce document headings.
+- `openDatabase(path)` 创建父目录并初始化文本、FTS5 和向量元数据表，返回由调用方关闭的
+  `node:sqlite` 连接。
+- `MemoryService(db, embedding?)` 可接收 Mock embedding provider。`syncSession(snapshot, summarize)`
+  接收完整线性 Session 快照。首次摘要使用全部有效消息，增量摘要只使用旧摘要和游标之后的消息；
+  模型失败不推进摘要游标。已配置 provider 时，摘要保存后补建向量；无新消息时也补建缺失向量。
+  创建服务时通过 `ready` 等待已有摘要的向量补建。`searchSummaries(request, mode?)` 异步返回
+  BM25（默认）或向量检索结果。
+- `MemoryService.readMessages(sessionId, keyword)` 按字面子串返回最近三条 User/Assistant 原文，
+  不返回 Tool Result。
+- `RAGService.scanDocuments()` 递归维护 Markdown 文档；`replaceDocumentIndex()` 可直接写入已准备的
+  Chunk，不强制重新切块。
+- `chunkMarkdown(text)` 生成最多 500 个 UTF-16 code unit、重叠 100 的 Chunk，并保留行号和章节。
+- `BM25Retriever(db, source).retrieve({ query, topK })` 按 `memory` 或 `document` 查询 FTS5。
+  SQLite 原生 BM25 取负后返回，因此分数越大越相关。
+- `JinaEmbeddingProvider(options)` 对 document 使用 `retrieval.passage`，对 query 使用
+  `retrieval.query`。响应必须按 index 完整覆盖输入，并通过数量、索引、维度和有限数值校验。
+- `VectorIndex(db, provider, batchSize?)` 按来源补建向量。`syncEmbeddings(source)` 不在 HTTP 等待期间
+  持有写事务；批次失败保留已完成数据；正文变化或删除会使旧向量失效；过期响应不能写回。
+- `VectorIndex.getStatus(source)` 返回 `{ total, indexed, pending }`。`search(source, vector, topK)`
+  仅在配置匹配且该来源完整时执行真实 sqlite-vec 余弦查询，返回分数降序结果。
+- `VectorRetriever` 在 query 编码前检查索引状态，编码后再次检查，再执行来源限定的向量查询。
+- `SearchService.search()` 只调用 BM25 Retriever；`vsearch()` 只调用 Vector Retriever。向量未配置
+  或失败时明确报错，不静默返回 BM25 结果。
 
-The few structural SQL assertions assume `documents(id, source_path)` and
-`chunks(document_id)`. They verify removal of deleted documents and orphan rows.
-Retrieval assertions use real FTS5 queries, not fake search results.
+## 结果与测试边界
 
-RAG tests copy `testDocs` into a temporary directory before changing any files.
-Until that directory is supplied, they use a copy of `docs/Memories.md` instead.
-An existing but empty `testDocs` is an error. Exact chunk boundaries are tested
-separately in `chunker.test.ts` with deterministic short inputs.
+BM25 和向量检索统一返回 `RetrievalHit`。Memory 结果由 `sourceType + sourceId` 标识；Document
+结果由 `sourceType + sourceId + chunkIndex` 标识。两种算法均按高分优先，但分数不能直接比较或
+相加。
 
-All test data lives in temporary directories. Tests do not read real sessions,
-write project indexes, load extensions into the agent, or make model requests.
-No external dependencies are added in this test-only step.
+RAG 测试会先把 `testDocs` 复制到临时目录。目录不存在时使用 `docs/Memories.md` 的副本；目录
+存在但没有 Markdown 文件时测试失败。所有修改和数据库文件都留在临时目录。
+
+固定向量只验证请求、存储、失效、排名和来源映射，不证明真实 Jina 模型的语义召回质量。
+真实 BEIR 和 LongMemEval 由 eval 命令单独运行。

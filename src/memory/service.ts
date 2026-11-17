@@ -1,24 +1,41 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { EmbeddingProvider } from "../embedding/provider.ts";
+import { BM25Retriever } from "../search/bm25.ts";
+import { SearchService } from "../search/service.ts";
+import { VectorRetriever } from "../search/vector.ts";
 import type {
 	IndexedMessage,
-	RetrievalHit,
-	RetrievalQuery,
 	SessionSnapshot,
 	SessionSummary,
 	SummaryGenerator,
 } from "./types.ts";
+import type { RetrievalHit, RetrievalQuery } from "../search/types.ts";
+import { VectorIndex } from "../embedding/vector-index.ts";
 
-/** Session indexing/retrieval independent of extension events and model providers. */
+/** Session indexing and retrieval independent of extension events and concrete model providers. */
 export class MemoryService {
 	private readonly db: DatabaseSync;
-	/** Use an initialized connection from openDatabase(); ownership remains with the caller. */
-	constructor(db: DatabaseSync) {
+	private readonly vectors?: VectorIndex;
+	private readonly search: SearchService;
+	/** Existing summaries are checked for missing vectors as soon as the service opens. */
+	readonly ready: Promise<void>;
+	/** Use a caller-owned database; an optional provider enables summary vectors and vsearch. */
+	constructor(db: DatabaseSync, embedding?: EmbeddingProvider) {
 		this.db = db;
+		this.vectors = embedding ? new VectorIndex(db, embedding) : undefined;
+		this.search = new SearchService(
+			new BM25Retriever(db, "memory"),
+			this.vectors && embedding ? new VectorRetriever(this.vectors, embedding, "memory") : undefined,
+		);
+		this.ready = this.vectors?.syncEmbeddings("memory") ?? Promise.resolve();
+		// Standalone BM25 callers need not observe startup backfill; explicit vector calls still check readiness.
+		void this.ready.catch(() => {});
 	}
 
 	/**
 	 * Commit raw messages, then create or incrementally replace the current session summary.
-	 * No new messages means no model call. Callers must serialize syncs for the same session.
+	 * No new messages means no summary model call; missing vectors are still backfilled.
+	 * Callers must serialize syncs for the same session.
 	 *
 	 * @param snapshot Complete entries in conversation order; previously saved messages must still be present.
 	 * @param generateSummary Model adapter or test substitute; receives the old summary and only new messages.
@@ -26,11 +43,16 @@ export class MemoryService {
 	 * Generation failure preserves committed raw messages and the previous summary/cursor. No automatic retry.
 	 */
 	async syncSession(snapshot: SessionSnapshot, generateSummary: SummaryGenerator): Promise<void> {
+		// Startup backfill may fail; a new sync gets another chance to fill the missing vectors.
+		await this.ready.catch(() => {});
 		const messages = this.extractMessages(snapshot);
 		this.saveSessionMessages(snapshot, messages);
 		const previous = this.getSessionSummary(snapshot.sessionId);
 		const newMessages = this.selectNewMessages(messages, previous?.leafEntryId);
-		if (!newMessages.length) return;
+		if (!newMessages.length) {
+			await this.vectors?.syncEmbeddings("memory");
+			return;
+		}
 		// Never hold a write transaction while waiting on a model request.
 		const text = await generateSummary(this.buildSummaryInput(previous, newMessages));
 		if (!text.trim()) throw new Error("Summary response was empty.");
@@ -40,37 +62,20 @@ export class MemoryService {
 			text,
 			timestamp: new Date().toISOString(),
 		});
+		// The summary is durable before the HTTP call. Failure leaves its vector pending for the next sync.
+		await this.vectors?.syncEmbeddings("memory");
 	}
 
 	/**
-	 * Search current summaries with default-tokenizer FTS5. Matches any extracted query term.
-	 * Includes all indexed sessions, including the current session; does not scan original files.
-	 *
-	 * @returns At most topK hits, ascending BM25 score then session ID. Empty/invalid input or no match returns [].
-	 * @throws SQLite errors. Extracted terms are quoted so user FTS operators cannot cause syntax errors.
+	 * Search current summaries. `search` uses FTS5 BM25; `vsearch` embeds the query and
+	 * retrieves stored summary vectors. A missing or incomplete vector index rejects.
 	 */
-	searchSummaries({ query, topK }: RetrievalQuery): RetrievalHit[] {
-		const terms = query.match(/[\p{L}\p{N}_]+/gu);
-		if (!terms?.length || !Number.isInteger(topK) || topK < 1) return [];
-		// Quoted tokens prevent user text from becoming FTS operators; OR permits partial recall.
-		const expression = terms.map((term) => `"${term}"`).join(" OR ");
-		return this.db
-			.prepare(`SELECT s.session_id, s.leaf_entry_id, s.content, s.timestamp,
-			t.source_path, bm25(summaries_fts) AS score FROM summaries_fts
-			JOIN summaries s ON s.rowid = summaries_fts.rowid JOIN sessions t ON t.id = s.session_id
-			WHERE summaries_fts MATCH ? ORDER BY score, s.session_id LIMIT ?`)
-			.all(expression, topK)
-			.map((row) => ({
-				text: String(row.content),
-				score: Number(row.score),
-				sourceType: "memory",
-				sourceId: String(row.session_id),
-				location: {
-					entryId: String(row.leaf_entry_id),
-					sourcePath: String(row.source_path),
-					timestamp: String(row.timestamp),
-				},
-			}));
+	async searchSummaries(request: RetrievalQuery, mode: "search" | "vsearch" = "search"): Promise<RetrievalHit[]> {
+		if (mode === "vsearch") {
+			await this.ready.catch(() => {});
+			return this.search.vsearch(request);
+		}
+		return this.search.search(request);
 	}
 
 	/**

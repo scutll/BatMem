@@ -143,9 +143,11 @@ export async function judgeAnswers(
 		official_prompt_commit: prompts.commit,
 		verdict_policy: "strict yes/no; invalid responses fail the run",
 		mode,
+		retrieval: mode === "memory" ? (run.retrieval ?? "search") : "none",
+		embedding: mode === "memory" ? run.embedding : undefined,
 	};
 	await writeFile(join(root, `metrics-${mode}.json`), JSON.stringify(metrics, null, 2));
-	console.info(`\n[result] 模式：${mode}；评分模型：${metrics.judge_models.join(", ")}`);
+	console.info(`\n[result] 模式：${mode}；检索：${metrics.retrieval}；评分模型：${metrics.judge_models.join(", ")}`);
 	console.info(
 		`query_count: ${metrics.query_count} - 已评分问题数，正确 ${judgments.filter((row) => row.label).length}，错误 ${judgments.filter((row) => !row.label).length}`,
 	);

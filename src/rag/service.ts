@@ -2,9 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { chunkMarkdown } from "./chunker.ts";
-import type { DocumentChunk, DocumentRecord, DocumentRetrievalHit, RetrievalQuery } from "./types.ts";
+import { BM25Retriever } from "../search/bm25.ts";
+import type { DocumentChunk, DocumentRecord, DocumentRetrievalHit } from "./types.ts";
+import type { RetrievalQuery } from "../search/types.ts";
 
 /** Local Markdown indexing and chunk retrieval. Source files are read, never modified. */
 export class RAGService {
@@ -24,15 +25,11 @@ export class RAGService {
 	 * but deletion cleanup runs only after every collected file was processed successfully.
 	 * Callers must serialize scans for the same directory.
 	 */
-	async scanDocuments(ctx?: ExtensionContext): Promise<void> {
+	async scanDocuments(): Promise<void> {
 		const paths = await this.collectMarkdownFiles(this.documentsDirectory);
-		if (ctx) {
-			ctx.ui.notify("scanning and building index for Documents", "info");
-		}
 		for (const path of paths) await this.indexDocument(path);
 		// An incomplete scan must never be interpreted as a set of deleted documents.
 		this.removeDeletedDocuments(new Set(paths));
-		ctx?.ui.notify("your agent is full of new power in brain!");
 	}
 
 	/** Hash content on every scan: size/mtime alone cannot detect same-size edits with restored timestamps. */
@@ -48,35 +45,9 @@ export class RAGService {
 		);
 	}
 
-	/**
-	 * Search current chunks with quoted OR terms, default-tokenizer FTS5 and native BM25 ranking.
-	 * Does not scan disk; callers may await startup indexing before searching.
-	 *
-	 * @returns At most topK hits with path, chunk index and one-based inclusive line coordinates.
-	 * Lowest scores rank first; ties use path and chunk index. Empty/invalid input or no match returns [].
-	 */
-	searchChunks({ query, topK }: RetrievalQuery): DocumentRetrievalHit[] {
-		const terms = query.match(/[\p{L}\p{N}_]+/gu);
-		if (!terms?.length || !Number.isInteger(topK) || topK < 1) return [];
-		const expression = terms.map((term) => `"${term}"`).join(" OR ");
-		return this.db
-			.prepare(`SELECT c.*, d.id, d.source_path, bm25(chunks_fts) AS score FROM chunks_fts
-			JOIN chunks c ON c.rowid = chunks_fts.rowid JOIN documents d ON d.id = c.document_id
-			WHERE chunks_fts MATCH ? ORDER BY score, d.source_path, c.chunk_index LIMIT ?`)
-			.all(expression, topK)
-			.map((row) => ({
-				text: String(row.content),
-				score: Number(row.score),
-				sourceType: "document",
-				sourceId: String(row.id),
-				location: {
-					sourcePath: String(row.source_path),
-					chunkIndex: Number(row.chunk_index),
-					startLine: Number(row.start_line),
-					endLine: Number(row.end_line),
-					section: row.section === null ? undefined : String(row.section),
-				},
-			}));
+	/** Search indexed chunks with higher-is-better BM25 scores; does not scan disk. */
+	searchChunks(request: RetrievalQuery): DocumentRetrievalHit[] {
+		return new BM25Retriever(this.db, "document").search(request) as DocumentRetrievalHit[];
 	}
 
 	/** Collect sorted absolute .md paths, case-insensitively. Do not follow symlinks outside the scan root. */

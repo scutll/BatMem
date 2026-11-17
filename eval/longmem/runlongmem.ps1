@@ -26,6 +26,9 @@ param(
     [ValidateSet('memory', 'no-memory')]
     [string]$Mode = 'memory',
 
+    [ValidateSet('search', 'vsearch')]
+    [string]$Retrieval = 'search',
+
     [string]$JudgeProvider,
     [string]$JudgeModel,
 
@@ -46,6 +49,11 @@ if ($ResumeDirectory) {
     $OutputDirectory = (Get-Item -LiteralPath $ResumeDirectory).FullName
     $runManifest = Get-Content -LiteralPath (Join-Path $OutputDirectory 'run-manifest.json') -Raw | ConvertFrom-Json
     if ($runManifest.status -ne 'prepared' -or @($runManifest.sampleDirectories).Count -lt 1) { throw 'A completed run manifest is required.' }
+    $savedRetrieval = if ($runManifest.PSObject.Properties['retrieval']) { $runManifest.retrieval } else { 'search' }
+    if ($PSBoundParameters.ContainsKey('Retrieval') -and $Retrieval -ne $savedRetrieval) {
+        throw 'Retrieval differs from the prepared run manifest.'
+    }
+    $Retrieval = $savedRetrieval
     $buildManifest = Get-Content -LiteralPath (Join-Path $runManifest.buildDirectory 'build-manifest.json') -Raw | ConvertFrom-Json
     if ($runManifest.buildFingerprint -ne $buildManifest.fingerprint) { throw 'Run manifest points to a different build fingerprint.' }
     $Limit = @($buildManifest.sampleDirectories).Count
@@ -90,10 +98,11 @@ if (-not $ResumeDirectory -and (Test-Path -LiteralPath $OutputDirectory)) { thro
 
 if (-not $ResumeDirectory) { Write-Host "Dataset: $($datasetFile.FullName)" }
 Write-Host "Output: $OutputDirectory"
-Write-Host "Model: $Provider/$Model; mode: $Mode; questions: up to $Limit"
+Write-Host "Model: $Provider/$Model; mode: $Mode; retrieval: $Retrieval; questions: up to $Limit"
 if ($Types) { Write-Host "Types: $Types" }
 Write-Host 'Answer and judge make real model calls.'
-if ($Mode -eq 'memory') { Write-Host 'Build also calls the model once per historical session for its summary.' }
+if ($Mode -eq 'memory') { Write-Host 'New summary builds call the model once per historical session; cached summaries are reused.' }
+if ($Retrieval -eq 'vsearch' -and $Mode -eq 'memory') { Write-Host 'Vector build calls Jina only for missing summary embeddings.' }
 
 $stages = @()
 if (-not $ResumeDirectory) { $stages += 'prepare' }
@@ -103,7 +112,7 @@ foreach ($stage in $stages) {
     Write-Host "Stage: $stage"
     $arguments = @(
         (Join-Path $PSScriptRoot 'run.ts'), '--stage', $stage,
-        '--output', $OutputDirectory, '--mode', $Mode
+        '--output', $OutputDirectory, '--mode', $Mode, '--retrieval', $Retrieval
     )
     if ($stage -eq 'prepare') {
 		$arguments += @('--dataset', $datasetFile.FullName, '--limit', "$Limit", '--provider', $Provider, '--model', $Model)

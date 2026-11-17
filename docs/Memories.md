@@ -2,163 +2,168 @@
 
 ## 总体架构
 
-基于 Pi Agent 的 Extension API，实现两项独立的上下文增强能力：
+BatMem 通过 Pi Extension 提供两类项目内记忆：
 
-- **Cross-session Memory**：对历史 Session 建立摘要与原文索引，支持跨会话检索、历史信息恢复和任务上下文延续。
-- **Document RAG**：对不同来源的文档进行统一解析、切块和索引，支持 Agent 根据 Query 检索相关文档内容。
+- **Cross-session Memory**：保存会话消息的文本投影和当前摘要，用于检索历史信息与延续任务。
+- **Document RAG**：将本地 Markdown 切块并建立索引，供 Agent 检索参考资料。
 
-两者都使用 SQLite 存储、全文检索和统一检索接口，但分别维护数据模型与索引。
+两类数据共用项目下的 `.pi/docs-memory/index.db`，分别检索摘要和文档块。原始 Session JSONL 与 Markdown 文件保留为来源。会话由 Pi 的 `SessionManager` 提供；跨会话搜索覆盖该数据库中已经同步的会话。
 
-本质上，Session Memory也可以看作是一种文档，因此也可以使用SQLite和相同的搜索或向量化机制
+```text
+Pi 生命周期 / Agent 工具                 src/index.ts
+  ├─ SessionSnapshot → MemoryService     src/memory/service.ts
+  │                    └─ 摘要模型       src/memory/summary.ts
+  ├─ Markdown → RAGService → Chunker     src/rag/service.ts、src/rag/chunker.ts
+  └─ SearchService                      src/search/service.ts
+       ├─ BM25Retriever → SQLite FTS5
+       └─ VectorRetriever → 查询编码 → VectorIndex → sqlite-vec
 
-Pi Extension 负责连接 Agent 生命周期、注册检索工具和管理上下文注入；具体的数据处理与检索逻辑由独立模块实现。
-
----
+文本与来源坐标 → SQLite → 缺失向量编码 → embeddings
+```
 
 ## Cross-session Memory
 
 ### 数据来源与存储
 
-以 Pi Session JSONL 为原始数据来源，读取历史会话中的用户消息、Assistant 消息和工具调用结果。
+`agent_end` 时，Extension 从 `ctx.sessionManager` 获取会话 ID、来源路径、项目目录和全部条目 `getEntries()`，组成 `SessionSnapshot`。
 
-记忆采用两种互补的存储形式：
+`MemoryService.extractMessages()` 提取 `user`、`assistant`、`toolResult` 消息，保存文本块，并将工具调用的名称与参数序列化为文本。图片、思考块和其他非消息记录不进入消息索引。数据库保存：
 
-- **Session Summary**：通过 LLM 总结整个 Session 的主要讨论内容、重要决策、任务进度、结论与未完成事项。
-- **Session Raw**：保留原始会话记录，并对消息内容建立可检索索引，以支持精确细节查询。
+- `sessions`：会话 ID、Session 文件路径和项目目录。
+- `messages`：以 `sessionId + entryId` 标识的消息文本、角色和时间。
+- `summaries`：每个会话一份当前摘要，以及处理游标 `leafEntryId` 和摘要更新时间。
 
-SQLite 保存 Session 元数据、Summary 和消息索引，同时保留原始 Session ID、Entry ID 等来源信息。
+同步按条目顺序处理；同一会话文件中的分支消息也会进入索引和摘要。
 
 ### 记忆构建与更新
 
-Summary的建立在用户完成一次对话后进行，即`agent_end`消息发出的时候
+```text
+agent_end → 捕获 SessionSnapshot → 排队等待前次同步
+  → syncSession()
+      → extractMessages() → saveSessionMessages()
+      → 读取旧摘要 → selectNewMessages()
+      → buildSummaryInput() → generateSessionSummary()
+      → saveSessionSummary() → FTS5 触发器更新
+      → syncEmbeddings("memory")（已配置 embedding 时）
+```
 
-通过Extension的 `ctx.sessionManager.getBranch()` 来获取上下文并重建整个(对话记录)
+原文先在事务中保存，已有消息 ID 跳过写入。首次摘要使用全部提取消息；后续使用旧摘要和游标之后的新消息。例如，摘要已覆盖 `m1…m3`，新增 `m4、m5` 后，模型输入为“旧摘要 + m4、m5”，成功后游标推进至 `m5`。没有新消息时跳过摘要生成，仍可补建向量；游标缺失时同步报错。`MemoryService` 创建时还会检查并补建已有摘要的向量，`index.ts` 只等待服务的 `ready` 状态。
 
-对对话记录进行摘要或摘要更新（取决于SQLite是否已经建立了该对话Branch的Summary）
+`generateSessionSummary()` 通过 `ctx.modelRegistry.complete()` 使用当前聊天模型和宿主认证，要求保留目标、事实、决策及原因、进度、结论和未完成事项。
 
-当SQLite已经有对应Session的Summary, 则通过Summary + leafEntryId之后的新消息来更新摘要(需要判断leafEntryId是否属于当前分支路径)，如果还没有Summary就要全量摘要(先不考虑上下文长度过长)
-
-Summary以`sessionId + leafEntryId`作为索引，`leafEntryId`标识该Session分支下最后一次摘要的消息，在寻找Summary的时候，可以通过回溯判断leafEntryId是否属于当前Branch
-**在当前开发与测试中，Session与Branch之间的处理没有那么关键并且也要更复杂，因此当前的开发中，先考虑使用者不使用分支的情况，每个Session都只有一个分支，但是仍然使用SessionId + leafEntryId进行索引, 后者用于判断是否需要更新Summary**
-
+摘要正文和游标在生成成功后一起保存。失败、空文本或截断响应会保留原文、旧摘要和旧游标，下一次同步继续处理未总结的消息。摘要更新使旧向量失效，随后补建。
 
 ### 记忆检索
 
-使用 SQLite FTS5 对 Session Summary 建立 BM25 全文索引， Session Raw Message通过字符串匹配寻找。
-SQLite的db文件创建于对话所属项目内文件夹，因此跨会话的范围应是限定于对话所属项目中
+记忆访问分为摘要召回与原文读取：
 
-检索机制分为两个层次：
+- **摘要召回**：`memory_search` 检索 `summaries`，支持 BM25 和向量搜索，返回摘要及来源信息。
+- **原文读取**：`memory_read(sessionId, keyword)` 调用 `readMessages()`，以 `instr()` 做区分大小写的字面子串匹配，返回指定会话中最新三条匹配 User/Assistant 消息。结果按时间、入库顺序倒序排列；空关键词返回空数组。
 
-- **Summary Search**：根据 Query 搜索相关历史会话的摘要，摘要还携带Session信息以便后续使用`memory_read`精细搜索对话内容
-- **Raw Search / Read**：通过`sessionId + 关键词` 搜索符合片段，返回字符串匹配的最近三条(Assistant/User)消息，这里只有SessionId, 在多分支的时候会在混合起来的各分支里面搜索相关关键词
-
-检索结果携带 Session ID、Entry ID、时间及原文定位信息。
+工具结果参与摘要输入。摘要结果中的 `entryId` 是处理游标，`timestamp` 是摘要更新时间；原文读取返回匹配消息的 Entry ID、消息时间和来源路径。
 
 ### Agent 集成
 
-通过 Pi Extension 提供两种记忆访问方式：
+主动检索由 Agent 调用 `memory_search`，再根据会话 ID 和关键词调用 `memory_read`。
 
-**主动检索**
+自动检索在 `before_agent_start` 执行：每次先清空候选，仅对 `messageType === "user"` 的输入调用 `MemoryService.searchSummaries({ query: event.prompt, topK: 1 })`，默认使用 BM25。有匹配时保存排名第一的摘要；当前会话也参与检索，候选没有额外相关性阈值。
 
-注册 `memory_search` 和 `memory_read` 工具，由 Agent 自主决定何时搜索历史会话或读取具体消息。
-
-**自动检索**
-
-在 `before_agent_start` 中，根据用户当前输入检索相关历史 Session Summary，并通过 `context` 事件将检索结果临时加入模型上下文，不持久化到 Session ，并避免重复注入（后续还可以考虑检查Context中是否已有该Summary，但是现在不考虑这个）。
-
-注意并非所有用户输入都需要自动检索相关历史对话信息，因为用户完全可能发起与以往对话完全无关的新话题，因此需要通过一定的阈值筛选来确定候选的注入Summary, 即相关程度达到一定阈值才进行注入。这里我们后续再考虑阈值，当前可以直接自动注入分数最高的一条Summary。
-
-------
+随后每次 `context` 事件在请求消息副本末尾追加一条 User 消息，包含候选 JSON，并标明其为参考数据。同一轮模型调用复用候选，下一轮重新检索；注入内容不写入 Session。
 
 ## Document RAG
 
 ### 文档来源与解析
 
-将不同格式的文档统一转换为可索引的文本及元数据。
+`session_start` 创建项目下的 `.pi/docs-memory/documents`，启动异步扫描。`RAGService.scanDocuments()` 递归收集本地 `.md` 文件，按路径排序并读取 UTF-8 文本。
 
-先只支持本地Markdown文件，指定默认目录，并在启动时通过异步任务扫描是否有更新
+文档记录包含 Document ID、来源路径、文本 SHA-256 和文件修改时间。每次扫描计算哈希，内容不变时复用索引，修改时保留 Document ID。扩展在会话启动时扫描，运行中的文件变化在后续扫描时进入索引。
 
-**(后续)不同资源通过Extension命令导入(如URL)，或通过放入默认文件夹自动扫描并建立索引**
+### 文档切块
 
-解析结果统一表示为 Document，包含：
+`chunkMarkdown()` 按 JavaScript 字符串位置切片：每块最多 500 个 UTF-16 编码单元，相邻块重叠 100，步长 400。切片保留原文和换行序列。
 
-- 文档 ID、来源与路径
-- 文档内容及结构
-- 定位信息`documentId, sourcePath, startLine-endLine, chunkIndex`
-- 文件更新时间与内容哈希
+每块保存从 0 开始的 `chunkIndex`、从 1 开始且含首尾的行号，以及块起点处的有效 `#` 标题；标题识别跳过围栏代码块。`Document ID + chunkIndex` 共同定位块。
 
-保留原始文件作为内容来源。
+### 文档索引
 
-### 文档切块与索引
+```text
+scanDocuments() → indexDocument() → 内容哈希比较
+  → chunkMarkdown() → replaceDocumentIndex()
+      → 事务替换文档记录和全部 Chunk → FTS5 触发器更新
+  → 全部文件处理成功后，清理扫描目录内已删除的文档
+  → syncEmbeddings("document")（已配置 embedding 时）
+```
 
-通过 Chunker 将解析后的文档划分为适合检索的文本片段。
+新增和修改按文件分别提交；修改会删除旧块及其向量，再写入当前块。删除文档通过级联与触发器清理块、全文索引和向量。扫描失败时，已经提交的文件更新保留，删除清理跳过。
 
-初始采用固定长度500字符、overlap100的文本切块方式，并保留 Chunk 与原始 Document 的关联。
-
-每个 Chunk 包含：
-
-- Chunk ID、Document ID
-- 文本内容
-- 文档来源与位置信息
-- 所属章节等元数据
-
-使用 SQLite 存储 Chunk 元数据，通过 FTS5 建立全文索引，支持 BM25 检索。
-
-根据文档内容哈希检测变化，对新增、修改或删除的文档更新索引。
+BM25 与向量检索使用同一批 Chunk。文本入库完成后生成缺失向量，embedding 失败时已保存的文本和 FTS5 索引继续可用。
 
 ### 文档检索
 
-先通过BM25实现Chunks检索，可以与Cross-Session Summary共用搜索接口。
-
-检索流程：
-
-```
-Query → BM25 Search → Top-K Chunks → Source Metadata → Agent
-```
-
-检索结果包含相关文本、匹配分数、文档来源以及原文定位信息。
-
-Agent可以通过`read()`阅读更多指定的文本内容，因此先不开发另外的读取工具
+`rag_search` 通过文档专用 `SearchService` 返回 Top-K 块，包含文本、分数、Document ID、来源路径、块序号、行号和章节。结果按块返回，同一文档可以有多个命中。Agent 可用宿主 `read` 工具按路径和行号读取更多上下文。
 
 ### Agent 集成
 
-通过 Pi Extension 注册文档检索工具：
-
-- `rag_search`：根据 Query 搜索相关文档片段与chunk定位信息。
-
-Agent 根据任务需要自主调用检索工具，将获得的文档内容作为回答或执行任务的参考依据。
-
-------
+Agent 按需调用 `rag_search`，等待启动扫描结束后检索已有索引；自动上下文注入使用会话摘要。
 
 ## 公共基础设施
 
 ### 存储层
 
-统一使用 SQLite 存储元数据和检索索引。
+`openDatabase()` 使用 `node:sqlite`，启用外键、WAL 和 5 秒锁等待。触发器维护 `summaries_fts` 与 `chunks_fts`；`retrieval_units` 视图统一摘要和文档块的文本、身份与来源坐标。
 
-Cross-session Memory 和 Document RAG 分别维护各自的数据表与 FTS5 索引，避免不同来源的数据混淆。
+向量以 Float32 BLOB 存入 `embeddings`，由来源类型和内容行的 rowid 关联检索单元。`embedding_config` 保存当前编码配置身份和维度。sqlite-vec 在向量操作初始化时加载。
 
-原始 Session JSONL 和文档文件不由索引数据替代。
+### Embedding 生成与更新
+
+`createEmbeddingProvider()` 读取 BatMem 根目录的 `.env` 和进程环境变量，文件值优先。`JINA_API_KEY` 为空时停用向量能力，BM25 继续可用。`HTTPS_PROXY` / `HTTP_PROXY` 配置 Jina 专用代理。
+
+当前扩展使用以下编码配置：
+
+| 项目 | 实现 |
+| --- | --- |
+| HTTP 接口 | `https://api.jina.ai/v1/embeddings` |
+| 模型与维度 | `jina-embeddings-v3`，1024 维 |
+| 摘要、文档块编码 | `retrieval.passage` |
+| 查询编码 | `retrieval.query` |
+| 输入与输出 | `truncate: false`、`late_chunking: false`、归一化浮点向量 |
+| 索引批次 | 默认每批 32 个检索单元 |
+
+`VectorIndex.syncEmbeddings(source)` 串行补建缺失向量，校验响应数量、顺序映射、维度和数值。等待 HTTP 时不持有写事务，写入前检查编码配置、来源身份及正文，跳过过期结果。
+
+正文变化或删除时清除旧向量；失败后已完成批次保留，后续同步补齐缺失部分。模型、维度或编码选项不兼容时报告错误；服务层可调用 `rebuild()` 清空向量、登记新配置，再重新同步。
+
+Jina 每次尝试超时 10 秒；网络错误、超时及 HTTP 408/429/5xx 最多重试三次。429 重试前等待 20 秒，其他可重试错误立即重试。其他 HTTP 错误及无效成功响应直接报错。
 
 ### 检索接口
 
-两个模块共享基础检索抽象。
+`SearchService` 接收 `{ query, topK }`，异步返回有序的 `RetrievalHit[]`。`MemoryService` 内部组合摘要的 BM25 与向量检索；Extension 为文档创建限定 `document` 来源的服务：
 
-Retriever 接收 Query、Top-K 和可选过滤条件，返回统一格式的 RetrievalHit。
+```text
+memory_search / rag_search
+  ├─ mode=search（默认）→ SearchService.search() → BM25Retriever.retrieve()
+  │    → 提取字母、数字、下划线组成的词项 → 引号包裹并用 OR 连接
+  │    → FTS5 MATCH → -bm25() → 按分数降序取 Top-K
+  └─ mode=vsearch → SearchService.vsearch() → VectorRetriever.retrieve()
+       → 检查配置及该来源向量完整性 → embedQuery(原始 Query)
+       → 再次检查索引 → VectorIndex.search()
+       → sqlite-vec 逐条计算余弦距离 → 按 1 - distance 降序取 Top-K
+```
 
-RetrievalHit 包含文本内容、匹配分数、来源类型、来源 ID 和原文定位信息。
+BM25 使用 FTS5 默认分词器，中文未做专门分词处理。向量查询对指定来源做精确扫描；向量未配置、配置不兼容、索引缺失向量或编码失败时抛出错误。
 
-Memory Retriever 与 Document Retriever 分别实现自己的检索流程。
-
-SQLite本身已经通过FTS5具备对query进行分词并用BM25搜索的能力，因此不需要自己实现BM25检索逻辑(对中文的支持程度较弱，但现在暂时不作其他考虑)
+两种方式经 `rowToHit()` 返回 `text`、`score`、`sourceType`、`sourceId`、`location`。分数越大越相关，算法间分数独立解释。摘要身份为 `sourceType + sourceId`，文档块再加 `location.chunkIndex`。当前每次执行单路召回并返回该路排序。
 
 ### Extension 集成层
 
-Extension 负责：
+| 生命周期或工具 | 调用与等待关系 |
+| --- | --- |
+| `session_start` | 等待旧扫描和摘要任务，关闭旧连接；打开项目数据库，创建服务，启动摘要向量补建和文档扫描、向量同步 |
+| `before_agent_start` / `context` | 用户输入触发摘要 BM25 检索；命中结果临时追加到每次请求上下文 |
+| `agent_end` | 按 `pendingSummary` 队列调用 `MemoryService.syncSession()`；该函数保存摘要后补建缺失向量，处理器等待完成 |
+| `memory_search` | 等待 `pendingSummary`；按 `mode` 搜索摘要，`topK` 默认 5，工具允许 1–100 |
+| `memory_read` | 直接读取指定会话中最新三条匹配 User/Assistant 消息 |
+| `rag_search` | 等待 `scan`；按 `mode` 搜索文档块，`topK` 默认 5，工具允许 1–100 |
+| `session_shutdown` | 等待扫描与摘要任务，关闭 embedding HTTP 连接及数据库，清空服务和候选 |
 
-- 使用 `pi.registerTool()` 暴露 Agent 工具。
-- 通过 Pi 生命周期事件触发记忆同步和自动检索。
-- 通过 `context` 事件管理检索信息的临时上下文注入。
-- 将检索、索引等操作委托给独立的 MemoryService 和 RAGService。
-
-底层服务不直接依赖 Pi Agent 的运行循环，使其能够被独立调用与测试。
+Extension 捕获后台扫描、摘要同步与向量构建错误并通过 UI 通知。底层服务负责返回结果或抛出错误，可脱离 Agent 运行循环独立调用。

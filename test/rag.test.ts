@@ -17,8 +17,8 @@ import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { openDatabase } from "../src/db.ts";
-import { RAGService } from "../src/rag.ts";
+import { openDatabase } from "../src/storage/db.ts";
+import { RAGService } from "../src/rag/service.ts";
 
 describe("Markdown retrieval", () => {
 	let directory: string;
@@ -160,7 +160,7 @@ describe("Markdown retrieval", () => {
 		assert.ok(rag.searchChunks({ query: "batmemtestpreserved", topK: 5 }).length > 0);
 	});
 
-	it("limits results, orders BM25 scores ascending and handles empty or malformed queries", async () => {
+	it("limits results, orders BM25 relevance descending and handles empty or malformed queries", async () => {
 		await writeFile(join(documents, "short.md"), "batmemtestquasar");
 		await writeFile(join(documents, "long.md"), "batmemtestquasar orbital deployment background notes");
 		await rag.scanDocuments();
@@ -168,7 +168,7 @@ describe("Markdown retrieval", () => {
 		assert.equal(hits.length, 2);
 		assert.equal(hits[0].location.sourcePath, join(documents, "short.md"));
 		assert.ok(hits.every((hit) => Number.isFinite(hit.score)));
-		assert.ok(hits[0].score <= hits[1].score);
+		assert.ok(hits[0].score >= hits[1].score);
 		assert.equal(rag.searchChunks({ query: "batmemtestquasar", topK: 1 }).length, 1);
 		assert.deepEqual(rag.searchChunks({ query: "batmemtestabsenttoken", topK: 5 }), []);
 		assert.deepEqual(rag.searchChunks({ query: "  ", topK: 5 }), []);

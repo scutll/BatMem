@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
-import { openDatabase } from "../../../src/db.ts";
+import { openDatabase } from "../../../src/storage/db.ts";
 import { BeirDataset, loadQueries } from "../beir.ts";
 import type { DatasetLoader } from "../dataset.ts";
 import { runRetrievalEval } from "../runner.ts";

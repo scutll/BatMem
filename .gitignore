@@ -22,6 +22,7 @@ eval/.venv/
 eval/**/__pycache__/
 eval/datasets/
 eval/**/runs/
+eval/rag/builds/
 
 
 # documents

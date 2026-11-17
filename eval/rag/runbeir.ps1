@@ -15,7 +15,12 @@ param(
 
     [Parameter(Position = 2)]
     [ValidatePattern('^[a-zA-Z0-9_-]+$')]
-    [string]$Split = 'test'
+    [string]$Split = 'test',
+
+    [ValidateSet('search', 'vsearch')]
+    [string]$Mode = 'search',
+
+    [string]$BuildsDirectory = (Join-Path $PSScriptRoot 'builds')
 )
 
 Set-StrictMode -Version Latest
@@ -53,12 +58,15 @@ foreach ($directory in Get-ChildItem -LiteralPath $runsDirectory -Directory) {
 $outputDirectory = Join-Path $runsDirectory ($datasetDirectory.Name + '--' + ($number + 1))
 Write-Host "Dataset: $($datasetDirectory.FullName)"
 Write-Host "Output: $outputDirectory"
+Write-Host "Mode: $Mode; Top-K: $TopK"
+Write-Host "Reusable indexes: $BuildsDirectory"
 
 # The runner creates output exclusively, protecting existing results even if two invocations race.
-& $nodePath (Join-Path $PSScriptRoot 'run.ts') --dataset $datasetDirectory.FullName --output $outputDirectory --top-k $TopK --split $Split
+& $nodePath (Join-Path $PSScriptRoot 'run.ts') --dataset $datasetDirectory.FullName --output $outputDirectory --top-k $TopK --split $Split --mode $Mode --builds $BuildsDirectory
 if ($LASTEXITCODE -ne 0) { throw "Retrieval failed (exit $LASTEXITCODE); partial results: $outputDirectory" }
 
 $cutoffs = @(1)
+Write-Host 'Stage: scoring retrieval results'
 if ($TopK -ge 5) { $cutoffs += 5 }
 if ($TopK -ne 1 -and $TopK -ne 5) { $cutoffs += $TopK }
 & $pythonPath (Join-Path $PSScriptRoot 'score_rag.py') $outputDirectory --k @cutoffs

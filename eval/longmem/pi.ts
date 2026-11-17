@@ -70,6 +70,7 @@ export function createTraceExtension(trace: TraceEvent[]): (pi: ExtensionAPI) =>
  * Create a fresh Pi Agent with its default system prompt and only BatMem's memory tools.
  * Model credentials come from the supplied runtime. All discovered resources/settings are isolated;
  * historical sessions and references are never restored into the answering Agent's conversation.
+ * Retrieval selects the BatMem default for both automatic summary recall and memory_search.
  */
 export async function createEvaluationSession(
 	cwd: string,
@@ -78,6 +79,7 @@ export async function createEvaluationSession(
 	trace: TraceEvent[],
 	useMemory = true,
 	storage?: EvaluationSessionStorage,
+	retrieval: "search" | "vsearch" = "search",
 ): Promise<AgentSession> {
 	const agentDir = storage?.agentDirectory ?? join(cwd, ".agent-config");
 	const sessionDirectory = storage?.sessionDirectory ?? join(cwd, "sessions");
@@ -97,7 +99,10 @@ export async function createEvaluationSession(
 		noPromptTemplates: true,
 		noThemes: true,
 		noContextFiles: true,
-		extensionFactories: [...(useMemory ? [registerBatMem] : []), createTraceExtension(trace)],
+		extensionFactories: [
+			...(useMemory ? [(pi: ExtensionAPI) => registerBatMem(pi, { memorySearchMode: retrieval, evalMode: true })] : []),
+			createTraceExtension(trace),
+		],
 	});
 	await loader.reload();
 	const { session, extensionsResult } = await createAgentSession({

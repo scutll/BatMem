@@ -3,16 +3,20 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
-import { openDatabase } from "../../../src/db.ts";
-import { MemoryService } from "../../../src/memory.ts";
+import { openDatabase } from "../../../src/storage/db.ts";
+import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
+import { MemoryService } from "../../../src/memory/service.ts";
+import { VectorIndex } from "../../../src/embedding/vector-index.ts";
 import { LongMemEvalDataset, parseSample } from "../longmemeval.ts";
 import {
 	buildMemory,
+	buildMemoryVectors,
 	createEvaluationRun,
 	loadPreparedSample,
 	prepareBuild,
 	prepareMemoryBuild,
 	prepareSample,
+	reconcileMemoryBuild,
 	runMemoryEval,
 	type MemoryBuildConfig,
 	type PreparedBuild,
@@ -35,7 +39,12 @@ const source = {
 	answer_session_ids: ["answer_id"],
 	haystack_session_ids: ["answer_id"],
 	haystack_dates: ["2023/05/20 (Sat) 02:21"],
-	haystack_sessions: [[{ role: "user", content: 'quasar pet is a cat; escaped } and " quote', has_answer: true }, { role: "assistant", content: "Noted" }]],
+	haystack_sessions: [
+		[
+			{ role: "user", content: 'quasar pet is a cat; escaped } and " quote', has_answer: true },
+			{ role: "assistant", content: "Noted" },
+		],
+	],
 };
 beforeEach(async () => {
 	root = await mkdtemp(join(tmpdir(), "batmem-longmem-"));
@@ -115,11 +124,19 @@ it("reuses an identical build cache and assigns repeated source sessions indepen
 		]),
 	);
 	const build = await prepareRun();
-	const reused = await prepareBuild(new LongMemEvalDataset(input), join(root, "builds"), { limit: 1, types: [] }, config);
+	const reused = await prepareBuild(
+		new LongMemEvalDataset(input),
+		join(root, "builds"),
+		{ limit: 1, types: [] },
+		config,
+	);
 	assert.equal(reused.directory, build.directory);
 	const prepared = await loadPreparedSample(build.directory, build.manifest.sampleDirectories[0]);
 	assert.equal(prepared.sample.histories.length, 2);
-	assert.deepEqual(prepared.sessions.map((session) => session.originalId), ["answer_id", "answer_id"]);
+	assert.deepEqual(
+		prepared.sessions.map((session) => session.originalId),
+		["answer_id", "answer_id"],
+	);
 	assert.equal(new Set(prepared.sessions.map((session) => session.sessionId)).size, 2);
 	assert.equal(new Set(prepared.sessions.map((session) => session.path)).size, 2);
 });
@@ -138,13 +155,13 @@ it("builds searchable SQLite memory and writes answer artifacts only to the run 
 	assert.equal(calls, 1);
 	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
 	try {
-		assert.equal(new MemoryService(db).searchSummaries({ query: "quasar", topK: 1 }).length, 1);
+		assert.equal((await new MemoryService(db).searchSummaries({ query: "quasar", topK: 1 })).length, 1);
 	} finally {
 		db.close();
 	}
 	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
 	await runMemoryEval(output, build, async ({ project, runtimeDirectory, question, date, trace }) => {
-		assert.equal(project, prepared.project);
+		assert.equal(project, join(output, build.manifest.sampleDirectories[0], "project"));
 		assert.equal(runtimeDirectory, join(output, build.manifest.sampleDirectories[0]));
 		assert.equal(question, source.question);
 		assert.equal(date, source.question_date);
@@ -156,25 +173,164 @@ it("builds searchable SQLite memory and writes answer artifacts only to the run 
 	assert.equal(JSON.parse(await readFile(join(output, "samples", "0001", "answer-memory.json"), "utf8")).text, "cat");
 });
 
-it("restores the build database after the answering Agent has used it", async () => {
+it("reuses a summary build across search and vsearch and resumes failed vector batches", async () => {
+	const build = await prepareRun();
+	const prepared = await loadPreparedSample(build.directory, build.sampleDirectories[0]);
+	let summaries = 0;
+	await buildMemory(prepared, async () => {
+		summaries++;
+		return "quasar pet cat";
+	});
+	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
+	const reused = await prepareBuild(
+		new LongMemEvalDataset(input),
+		join(root, "builds"),
+		{ limit: 1, types: [] },
+		config,
+	);
+	assert.equal(reused.directory, build.directory);
+	assert.equal(await prepareMemoryBuild(prepared, JSON.stringify(config)), false);
+
+	let fail = true;
+	const encoded: string[] = [];
+	const embedding: EmbeddingProvider = {
+		identity: "test/longmem-2d:v1",
+		dimensions: 2,
+		async embedDocuments(texts) {
+			encoded.push(...texts);
+			if (fail) throw new Error("embedding unavailable");
+			return texts.map(() => [1, 0]);
+		},
+		async embedQuery() {
+			return [1, 0];
+		},
+	};
+	const incompleteRun = join(root, "incomplete-vector-run");
+	await createEvaluationRun(incompleteRun, reused, "vsearch", embedding);
+	let answered = false;
+	await assert.rejects(
+		runMemoryEval(
+			incompleteRun,
+			reused,
+			async () => {
+				answered = true;
+				return { text: "cat", usage: [], elapsedMs: 1 };
+			},
+			"memory",
+			"vsearch",
+			embedding,
+		),
+		/questions failed/,
+	);
+	assert.equal(answered, false);
+	await assert.rejects(buildMemoryVectors(prepared, embedding), /embedding unavailable/);
+	fail = false;
+	await buildMemoryVectors(prepared, embedding);
+	assert.deepEqual(encoded, ["quasar pet cat", "quasar pet cat"]);
+	assert.equal(summaries, 1);
+
+	const vectorRun = join(root, "vector-run");
+	const manifest = await createEvaluationRun(vectorRun, reused, "vsearch", embedding);
+	assert.equal(manifest.retrieval, "vsearch");
+	assert.equal(manifest.embedding?.identity, embedding.identity);
+	await runMemoryEval(
+		vectorRun,
+		reused,
+		async () => ({ text: "cat", usage: [], elapsedMs: 1 }),
+		"memory",
+		"vsearch",
+		embedding,
+	);
+	assert.match(await readFile(join(vectorRun, "answers-memory.jsonl"), "utf8"), /"cat"/);
+});
+
+it("rejects old answer sessions in a build and removes only those sessions during repair", async () => {
 	const build = await prepareRun();
 	const prepared = await loadPreparedSample(build.directory, build.manifest.sampleDirectories[0]);
 	await buildMemory(prepared, async () => "quasar pet cat");
 	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
 	const dbPath = join(prepared.project, ".pi", "docs-memory", "index.db");
+	const db = openDatabase(dbPath);
+	try {
+		db.prepare("INSERT INTO sessions VALUES (?, ?, ?)").run("old-answer", "old-answer.jsonl", prepared.project);
+		db.prepare("INSERT INTO summaries VALUES (?, ?, ?, ?)").run("old-answer", "entry", "leaked answer", "2023-05-30");
+		await new VectorIndex(db, {
+			identity: "test/cleanup-2d:v1",
+			dimensions: 2,
+			async embedDocuments(texts) { return texts.map(() => [1, 0]); },
+			async embedQuery() { return [1, 0]; },
+		}).syncEmbeddings("memory");
+	} finally {
+		db.close();
+	}
+	let answered = false;
+	await assert.rejects(
+		runMemoryEval(output, build, async () => {
+			answered = true;
+			return { text: "cat", usage: [], elapsedMs: 1 };
+		}),
+		/questions failed/,
+	);
+	assert.equal(answered, false);
+	assert.equal(reconcileMemoryBuild(prepared, true), 1);
+	assert.equal(reconcileMemoryBuild(prepared, false), 0);
+	const verified = openDatabase(dbPath);
+	try {
+		assert.deepEqual(
+			verified.prepare("SELECT id FROM sessions").all().map((row) => row.id),
+			[prepared.sessions[0].sessionId],
+		);
+		assert.equal(verified.prepare("SELECT COUNT(*) AS n FROM summaries").get()?.n, 1);
+		assert.equal(verified.prepare("SELECT COUNT(*) AS n FROM embeddings WHERE source_type = 'memory'").get()?.n, 1);
+	} finally {
+		verified.close();
+	}
+});
+
+it("rejects a ready build when an imported history has no summary", async () => {
+	const build = await prepareRun();
+	const prepared = await loadPreparedSample(build.directory, build.sampleDirectories[0]);
+	await buildMemory(prepared, async () => "quasar pet cat");
+	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
+	try {
+		db.prepare("DELETE FROM summaries WHERE session_id = ?").run(prepared.sessions[0].sessionId);
+	} finally {
+		db.close();
+	}
+	assert.throws(() => reconcileMemoryBuild(prepared, false), /missing 1 historical summaries/);
+	assert.throws(() => reconcileMemoryBuild(prepared, true), /missing 1 historical summaries/);
+});
+
+it("answers without creating a build lock or backup", async () => {
+	const build = await prepareRun();
+	const prepared = await loadPreparedSample(build.directory, build.sampleDirectories[0]);
+	await buildMemory(prepared, async () => "quasar pet cat");
+	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
+	const dbPath = join(prepared.project, ".pi", "docs-memory", "index.db");
 	const before = await readFile(dbPath);
-	await runMemoryEval(output, build, async () => {
-		await writeFile(dbPath, "transient agent write");
-		return { text: "cat", usage: [], elapsedMs: 1 };
-	});
+	await runMemoryEval(output, build, async () => ({ text: "cat", usage: [], elapsedMs: 1 }));
+	assert.match(await readFile(join(output, "answers-memory.jsonl"), "utf8"), /"cat"/);
 	assert.deepEqual(await readFile(dbPath), before);
+	assert.ok((await readFile(join(output, "samples", "0001", "project", ".pi", "docs-memory", "index.db"))).length > 0);
+	await assert.rejects(readFile(join(prepared.directory, ".answer.lock")), /ENOENT/);
+	await assert.rejects(readFile(join(output, "samples", "0001", ".memory-backup", "index.db")), /ENOENT/);
 });
 
 it("records question failures instead of judging partial answers", async () => {
 	const build = await prepareRun();
 	const prepared = await loadPreparedSample(build.directory, build.manifest.sampleDirectories[0]);
-	await assert.rejects(buildMemory(prepared, async () => { throw new Error("Model unavailable"); }), /unavailable/);
-	await assert.rejects(runMemoryEval(output, build, async () => { throw new Error("Must not answer without ready memory"); }), /questions failed/);
+	await assert.rejects(
+		buildMemory(prepared, async () => {
+			throw new Error("Model unavailable");
+		}),
+		/unavailable/,
+	);
+	await assert.rejects(
+		runMemoryEval(output, build, async () => {
+			throw new Error("Must not answer without ready memory");
+		}),
+		/questions failed/,
+	);
 	assert.equal(await readFile(join(output, "answers-memory.jsonl"), "utf8"), "");
 	assert.match(await readFile(join(output, "failures-memory.jsonl"), "utf8"), /q1/);
 });
@@ -183,11 +339,16 @@ it("uses the same build project as the no-memory Pi cwd without opening its cach
 	await writeFile(input, JSON.stringify([source, { ...source, question_id: "q2" }]));
 	const build = await prepareRun([], 2);
 	const projects = new Set<string>();
-	await runMemoryEval(output, build, async ({ project, runtimeDirectory }) => {
-		projects.add(project);
-		assert.ok(runtimeDirectory.startsWith(output));
-		return { text: "unknown", usage: [], elapsedMs: 1 };
-	}, "no-memory");
+	await runMemoryEval(
+		output,
+		build,
+		async ({ project, runtimeDirectory }) => {
+			projects.add(project);
+			assert.ok(runtimeDirectory.startsWith(output));
+			return { text: "unknown", usage: [], elapsedMs: 1 };
+		},
+		"no-memory",
+	);
 	assert.equal(projects.size, 2);
 	assert.ok([...projects].every((path) => path.includes(`${join("samples", "").slice(0, -1)}`)));
 });
@@ -213,5 +374,8 @@ it("rebuilds an interrupted sample from a fresh database and skips completed sam
 	assert.equal(await prepareMemoryBuild(prepared, serializedConfig), false);
 	assert.deepEqual(await readFile(dbPath), before);
 	await assert.rejects(prepareMemoryBuild(prepared, "changed"), /configuration changed/);
-	await assert.rejects(prepareMemoryBuild({ ...prepared, project: root }, serializedConfig), /refusing database deletion/);
+	await assert.rejects(
+		prepareMemoryBuild({ ...prepared, project: root }, serializedConfig),
+		/refusing database deletion/,
+	);
 });

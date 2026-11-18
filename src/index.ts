@@ -4,16 +4,18 @@ import type { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createEmbeddingProvider } from "./config.ts";
-import { openDatabase } from "./storage/db.ts";
 import type { JinaEmbeddingProvider } from "./embedding/jina.ts";
+import type { EmbeddingProvider } from "./embedding/provider.ts";
+import { VectorIndex } from "./embedding/vector-index.ts";
 import { MemoryService } from "./memory/service.ts";
+import { generateSessionSummary } from "./memory/summary.ts";
 import { RAGService } from "./rag/service.ts";
 import { BM25Retriever } from "./search/bm25.ts";
 import { SearchService } from "./search/service.ts";
-import { VectorRetriever } from "./search/vector.ts";
-import { generateSessionSummary } from "./memory/summary.ts";
 import type { RetrievalHit } from "./search/types.ts";
-import { VectorIndex } from "./embedding/vector-index.ts";
+import { VectorRetriever } from "./search/vector.ts";
+import { openDatabase } from "./storage/db.ts";
+import type { BatMemOptions } from "./types.ts";
 
 /**
  * Register project-local memory/RAG tools and their lifecycle hooks.
@@ -23,11 +25,9 @@ import { VectorIndex } from "./embedding/vector-index.ts";
  * @param pi Host extension API. Registration itself performs no filesystem or model operations.
  * @param options.memorySearchMode Default for automatic summary recall and memory_search when its mode is omitted.
  * @param options.evalMode Read an existing memory index without synchronization or document indexing.
+ * @param options.embedding Borrowed provider, null to disable, or undefined to create an owned provider from configuration.
  */
-export default function registerExtension(
-	pi: ExtensionAPI,
-	options: { memorySearchMode?: "search" | "vsearch"; evalMode?: boolean } = {},
-): void {
+export default function registerExtension(pi: ExtensionAPI, options: BatMemOptions = {}): void {
 	const memorySearchMode = options.memorySearchMode ?? "search";
 	const evalMode = options.evalMode ?? false;
 	let db: DatabaseSync | undefined;
@@ -35,7 +35,8 @@ export default function registerExtension(
 	let evalSearch: SearchService | undefined;
 	let rag: RAGService | undefined;
 	let documentVectors: VectorIndex | undefined;
-	let provider: JinaEmbeddingProvider | undefined;
+	let provider: EmbeddingProvider | undefined;
+	let ownedProvider: JinaEmbeddingProvider | undefined;
 	let documentSearch: SearchService | undefined;
 	let scan: Promise<void> = Promise.resolve();
 	let pendingSummary: Promise<void> = Promise.resolve();
@@ -45,7 +46,7 @@ export default function registerExtension(
 	// Session switches may reuse this extension instance. Finish old work before replacing its connection.
 	pi.on("session_start", async (_event, ctx) => {
 		await Promise.all([scan, pendingSummary]);
-		await provider?.close();
+		await ownedProvider?.close();
 		db?.close();
 		candidate = undefined;
 		const directory = join(ctx.sessionManager.getCwd(), ".pi", "docs-memory");
@@ -53,7 +54,8 @@ export default function registerExtension(
 		if (!evalMode) await mkdir(documents, { recursive: true });
 		db = openDatabase(join(directory, "index.db"));
 		// Credentials enable vector construction; BM25 remains the default tool/automatic search mode.
-		provider = createEmbeddingProvider();
+		ownedProvider = options.embedding === undefined ? createEmbeddingProvider() : undefined;
+		provider = options.embedding === undefined ? ownedProvider : (options.embedding ?? undefined);
 		// Eval reads existing vectors without starting MemoryService's automatic backfill.
 		memory = new MemoryService(db, evalMode ? undefined : provider);
 		if (evalMode) {
@@ -110,9 +112,11 @@ export default function registerExtension(
 		candidate = undefined;
 		if (event.messageType === "user") {
 			const request = { query: event.prompt, topK: 1 };
-			candidate = (evalMode
-				? await evalSearch?.[memorySearchMode](request)
-				: await memory?.searchSummaries(request, memorySearchMode))?.[0];
+			candidate = (
+				evalMode
+					? await evalSearch?.[memorySearchMode](request)
+					: await memory?.searchSummaries(request, memorySearchMode)
+			)?.[0];
 		}
 	});
 
@@ -135,7 +139,8 @@ export default function registerExtension(
 	// Await both file indexing and summary generation before invalidating services and closing their connection.
 	pi.on("session_shutdown", async () => {
 		await Promise.all([scan, pendingSummary]);
-		await provider?.close();
+		await ownedProvider?.close();
+		ownedProvider = undefined;
 		provider = undefined;
 		db?.close();
 		db = undefined;
@@ -157,10 +162,10 @@ export default function registerExtension(
 			query: Type.String(),
 			topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
 			mode: Type.Optional(
-				Type.Union([Type.Literal("search"), Type.Literal("vsearch")], {
+				Type.Union([Type.Literal("search"), Type.Literal("vsearch"), Type.Literal("query")], {
 					description: evalMode
 						? `Evaluation retrieval is fixed to ${memorySearchMode}; omit this parameter.`
-						: "search: keyword BM25 (default); vsearch: semantic vector search, requires configured embeddings.",
+						: "search: BM25 (default); vsearch: vector; query: BM25 + vector recall with RRF fusion and a top-rank bonus. Vector modes require embeddings.",
 				}),
 			),
 		}),
@@ -169,7 +174,7 @@ export default function registerExtension(
 			if (!memory) throw new Error("Memory database is not initialized.");
 			const request = { query: params.query, topK: params.topK ?? 5 };
 			// A dataset run must not mix retrieval strategies because the model supplied a tool argument.
-			const mode = evalMode ? memorySearchMode : params.mode ?? memorySearchMode;
+			const mode = evalMode ? memorySearchMode : (params.mode ?? memorySearchMode);
 			let hits: RetrievalHit[];
 			if (evalMode) {
 				if (!evalSearch) throw new Error("Evaluation search is not initialized.");
@@ -200,9 +205,9 @@ export default function registerExtension(
 			query: Type.String(),
 			topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
 			mode: Type.Optional(
-				Type.Union([Type.Literal("search"), Type.Literal("vsearch")], {
+				Type.Union([Type.Literal("search"), Type.Literal("vsearch"), Type.Literal("query")], {
 					description:
-						"search: keyword BM25 (default); vsearch: semantic vector search, requires configured embeddings.",
+						"search: BM25 (default); vsearch: vector; query: BM25 + vector recall with RRF fusion and a top-rank bonus. Vector modes require embeddings.",
 				}),
 			),
 		}),

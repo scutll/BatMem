@@ -1,6 +1,6 @@
 # BatMem 测试项
 
-本文记录随功能迭代更新的测试要求，不代表所有条目已经实现或通过。当前基础能力为摘要、原文读取、Markdown 切块与 BM25；本轮新增 embedding、向量搜索、统一搜索入口及 eval 构建缓存复用。RRF、rerank、query expansion 和多路召回不属于本轮范围。
+本文记录随功能迭代更新的测试要求，不代表所有条目已经实现或通过。当前支持摘要、原文读取、Markdown 切块、BM25、向量搜索和 eval 构建复用。本轮增加 query 多路召回框架及 embedding 透传 Processor，不实现 RRF、rerank 或 query expansion。下文原有“本轮新增”表格仍作为测试要求，实际接口以 `test/CONTRACT.md` 为准。
 
 ## 测试方式
 
@@ -145,15 +145,30 @@
 
 ## 执行与验收
 
+### Query 已实现的离线覆盖
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `test/query.test.ts` | 三路并发启动、等待全部结束、同步/异步失败后排空任务、请求与并发调用隔离、路径校验、Processor 透传和错误传播 |
+| `test/search.test.ts` | query 与真实 sqlite-vec 排名一致，BM25 排名不同不影响输出；保留不同 chunk 坐标，索引不完整时不编码查询 |
+| `test/memory.test.ts` | query 等待启动补建，摘要游标正确，正文变化后拒绝不完整向量 |
+| `test/extension.test.ts` | 普通 memory_search/rag_search 的 query 路径与无 provider 错误，调用方保留 provider 所有权 |
+| `eval/rag/test/eval.test.ts` | search/vsearch/query 共享 build，query 与 vsearch 导出一致，记录 pipeline 与源码哈希，失败不发布完成 manifest |
+| `eval/longmem/test/runner.test.ts` | query 复用摘要和向量，完整性检查在回答前执行，缓存与 run 副本隔离 |
+| `eval/longmem/test/pi.test.ts` | 真实 Pi SDK + faux 模型 + 固定向量，query 自动注入与工具搜索，模型传入其他 mode 不改变固定评测模式 |
+| `eval/longmem/test/judge.test.ts` | query 标识进入指标，Judge 不调用 embedding |
+
+并发测试使用明确的任务启动信号和可控 Promise，不用 sleep 或耗时推断。query 的输出与 vsearch 相同只证明透传行为；另行检查两路执行及完整汇总。
+
 现有测试命令如下，从 BatMem 目录执行；新增测试文件落地后同步补充。
 
 ```powershell
-node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts
+node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts test/query.test.ts test/extension.test.ts
 node --test eval/rag/test/eval.test.ts
 .\eval\.venv\Scripts\python.exe -m unittest discover -s eval/rag/test -p test_score_rag.py
 node --test eval/longmem/test/*.test.ts
 ```
 
-`test/CONTRACT.md` 仍描述现有同步搜索、原生 BM25 分数及仅 Mock 摘要模型的契约。本轮改代码和测试时，应同步为异步入口、统一分数方向和 Mock embedding，不把旧契约当作新设计。
+`test/CONTRACT.md` 描述当前异步搜索、分数方向、Recall/Processor 和离线 provider 契约。BatMem 的 `npm run check` 独立覆盖 src、test 与 eval；仓库根类型检查不包含 BatMem。
 
 固定向量和 Mock HTTP 验证程序行为，不证明 Jina 的实际召回能力。真实 BEIR/LongMemEval 由使用者明确发起，按 Eval.md 保存模型、retrieval、构建身份和指标；真实模型调用不进入默认自动化测试。展示结果时区分“测试通过”和“真实数据集评测成绩”。

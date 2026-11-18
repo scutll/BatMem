@@ -1,3 +1,4 @@
+import type { EvaluationSessionStorage, QuestionResult, TraceEvent } from "./types.ts";
 /**
  * 在单个测试数据文件夹中创建Pi Agent，以实现Pi在不同会话测试集中的隔离效果
  *
@@ -15,23 +16,9 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
 import registerBatMem from "../../src/index.ts";
-
-export interface TraceEvent {
-	type: string;
-	data: unknown;
-}
-export interface QuestionResult {
-	text: string;
-	usage: AssistantMessage["usage"][];
-	elapsedMs: number;
-}
-
-/** Keep Pi's newly created session and resource state with one evaluation run, not in the build cache. */
-export interface EvaluationSessionStorage {
-	agentDirectory: string;
-	sessionDirectory: string;
-}
+import type { SearchMode } from "../../src/search/types.ts";
 
 /** Observe evidence and the actual Pi system prompt without replacing either. No provider headers are logged. */
 export function createTraceExtension(trace: TraceEvent[]): (pi: ExtensionAPI) => void {
@@ -79,7 +66,8 @@ export async function createEvaluationSession(
 	trace: TraceEvent[],
 	useMemory = true,
 	storage?: EvaluationSessionStorage,
-	retrieval: "search" | "vsearch" = "search",
+	retrieval: SearchMode = "search",
+	embedding?: EmbeddingProvider | null,
 ): Promise<AgentSession> {
 	const agentDir = storage?.agentDirectory ?? join(cwd, ".agent-config");
 	const sessionDirectory = storage?.sessionDirectory ?? join(cwd, "sessions");
@@ -100,7 +88,9 @@ export async function createEvaluationSession(
 		noThemes: true,
 		noContextFiles: true,
 		extensionFactories: [
-			...(useMemory ? [(pi: ExtensionAPI) => registerBatMem(pi, { memorySearchMode: retrieval, evalMode: true })] : []),
+			...(useMemory
+				? [(pi: ExtensionAPI) => registerBatMem(pi, { memorySearchMode: retrieval, evalMode: true, embedding })]
+				: []),
 			createTraceExtension(trace),
 		],
 	});

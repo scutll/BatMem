@@ -2,23 +2,14 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { openDatabase } from "../../src/storage/db.ts";
 import { RAGService } from "../../src/rag/service.ts";
+import { openDatabase } from "../../src/storage/db.ts";
 import type { CorpusRecord, DatasetLoader } from "./dataset.ts";
 import { Progress } from "./progress.ts";
+import type { CorpusBuild } from "./types.ts";
 
 // Bump when stored chunk coordinates or FTS/tokenizer semantics change, not for retrieval-only edits.
 const INDEX_FORMAT = "whole-record-v1:fts5-default";
-
-export interface CorpusBuild {
-	db: DatabaseSync;
-	path: string;
-	fingerprint: string;
-	count: number;
-	reused: boolean;
-	/** Release both the content connection and its process-owned build lock. */
-	close(): void;
-}
 
 /** Hash prepared IDs/text, independent of query split, topK, source paths and search implementation. */
 export async function fingerprintCorpus(loader: DatasetLoader): Promise<{ fingerprint: string; count: number }> {

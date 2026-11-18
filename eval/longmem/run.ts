@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createEmbeddingProvider } from "../../src/config.ts";
 import type { JinaEmbeddingProvider } from "../../src/embedding/jina.ts";
 import { generateSessionSummary, SUMMARY_SYSTEM_PROMPT } from "../../src/memory/summary.ts";
+import { isSearchMode } from "../../src/search/modes.ts";
+import type { SearchMode } from "../../src/search/types.ts";
 import { judgeAnswers } from "./judge.ts";
 import { LONG_MEM_EVAL_QUESTION_TYPES, LongMemEvalDataset } from "./longmemeval.ts";
 import { closeEvaluationSession, createEvaluationSession, runQuestion } from "./pi.ts";
@@ -20,9 +22,8 @@ import {
 	prepareMemoryBuild,
 	reconcileMemoryBuild,
 	runMemoryEval,
-	type MemoryBuildConfig,
-	type PreparedBuild,
 } from "./runner.ts";
+import type { MemoryBuildConfig, PreparedBuild } from "./types.ts";
 
 /** CLI wiring only: build owns reusable data; each run directory owns answers and Judge results. */
 const { values } = parseArgs({
@@ -46,8 +47,8 @@ const stage = values.stage;
 if (!values.output || !["prepare", "build", "answer", "judge", "all"].includes(stage))
 	throw new Error("Require --output and --stage prepare|build|answer|judge|all.");
 if (values.mode !== "memory" && values.mode !== "no-memory") throw new Error("mode must be memory or no-memory.");
-if (values.retrieval && values.retrieval !== "search" && values.retrieval !== "vsearch")
-	throw new Error("retrieval must be search or vsearch.");
+const requestedRetrieval = values.retrieval ?? "search";
+if (!isSearchMode(requestedRetrieval)) throw new Error("retrieval must be search, vsearch or query.");
 const mode = values.mode;
 const output = resolve(values.output);
 const timeoutMs = Number(values["timeout-ms"]);
@@ -56,14 +57,14 @@ const started = Date.now();
 console.info(`[eval] 阶段：${stage}；模式：${mode}；输出：${output}`);
 
 let build: PreparedBuild;
-let retrieval: "search" | "vsearch";
+let retrieval: SearchMode;
 let embedding: JinaEmbeddingProvider | undefined;
 try {
 	if (stage === "prepare" || stage === "all") {
-		retrieval = values.retrieval === "vsearch" ? "vsearch" : "search";
-		if (retrieval === "vsearch" && mode === "no-memory") throw new Error("vsearch requires memory mode.");
-		embedding = retrieval === "vsearch" ? createEmbeddingProvider() : undefined;
-		if (retrieval === "vsearch" && !embedding) throw new Error("vsearch requires JINA_API_KEY in BatMem/.env.");
+		retrieval = requestedRetrieval;
+		if (retrieval !== "search" && mode === "no-memory") throw new Error(`${retrieval} requires memory mode.`);
+		embedding = retrieval !== "search" ? createEmbeddingProvider() : undefined;
+		if (retrieval !== "search" && !embedding) throw new Error(`${retrieval} requires JINA_API_KEY in BatMem/.env.`);
 		if (!values.dataset || !values.provider || !values.model)
 			throw new Error("Preparation requires --dataset, --provider and --model.");
 		const limit = Number(values.limit);
@@ -91,10 +92,10 @@ try {
 		retrieval = run.retrieval ?? "search";
 		if (values.retrieval && values.retrieval !== retrieval)
 			throw new Error("Retrieval mode differs from the run manifest.");
-		if (retrieval === "vsearch" && stage !== "judge") {
+		if (retrieval !== "search" && stage !== "judge") {
 			if (mode === "memory") {
 				embedding = createEmbeddingProvider();
-				if (!embedding) throw new Error("vsearch requires JINA_API_KEY in BatMem/.env.");
+				if (!embedding) throw new Error(`${retrieval} requires JINA_API_KEY in BatMem/.env.`);
 				if (embedding.identity !== run.embedding?.identity || embedding.dimensions !== run.embedding.dimensions)
 					throw new Error("Embedding configuration differs from the prepared run.");
 			}
@@ -157,7 +158,7 @@ try {
 						`[build ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 建库完成，已保存 memory-ready.json`,
 					);
 				}
-				if (retrieval === "vsearch" && embedding) await buildMemoryVectors(prepared, embedding);
+				if (retrieval !== "search" && embedding) await buildMemoryVectors(prepared, embedding);
 			}
 		}
 		if (stage === "answer" || stage === "all") {
@@ -192,6 +193,7 @@ try {
 							sessionDirectory: join(runtimeDirectory, "sessions"),
 						},
 						retrieval,
+						embedding ?? null,
 					);
 					try {
 						return await runQuestion(session, question, date, timeoutMs);

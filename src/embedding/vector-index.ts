@@ -1,20 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { load } from "sqlite-vec";
-import type { EmbeddingProvider } from "./provider.ts";
 import { rowToHit } from "../search/rows.ts";
 import type { RetrievalHit } from "../search/types.ts";
-
-interface PendingEmbedding {
-	unitId: number;
-	sourceId: string;
-	text: string;
-}
-
-export interface VectorIndexStatus {
-	total: number;
-	indexed: number;
-	pending: number;
-}
+import type { EmbeddingProvider } from "./provider.ts";
+import type { PendingEmbedding, VectorIndexStatus } from "./types.ts";
 
 const loadedConnections = new WeakSet<DatabaseSync>();
 

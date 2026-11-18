@@ -4,13 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
-import { openDatabase } from "../src/storage/db.ts";
 import type { EmbeddingProvider } from "../src/embedding/provider.ts";
-import { BM25Retriever } from "../src/search/bm25.ts";
-import { SearchService } from "../src/search/service.ts";
-import { VectorRetriever } from "../src/search/vector.ts";
-import type { RetrievalHit, Retriever } from "../src/search/types.ts";
 import { VectorIndex } from "../src/embedding/vector-index.ts";
+import { BM25Retriever } from "../src/search/bm25.ts";
+import { BM25EmbeddingRecall } from "../src/search/bm25-embedding-recall.ts";
+import { EmbeddingQueryProcessor } from "../src/search/embedding-query-processor.ts";
+import { SearchService } from "../src/search/service.ts";
+import type { RetrievalHit, Retriever } from "../src/search/types.ts";
+import { VectorRetriever } from "../src/search/vector.ts";
+import { openDatabase } from "../src/storage/db.ts";
+import { OfflineReranker } from "./helpers/reranking.ts";
+
+function createSearchService(bm25: Retriever, vector: Retriever): SearchService {
+	return new SearchService(bm25, vector, {
+		recall: new BM25EmbeddingRecall(bm25, vector),
+		processor: new EmbeddingQueryProcessor(new OfflineReranker()),
+	});
+}
 
 function hit(sourceId: string, score: number): RetrievalHit {
 	return {
@@ -51,7 +61,10 @@ describe("search services", () => {
 		}
 		const retriever = new BM25Retriever(db, "memory");
 		const hits = await retriever.retrieve({ query: "quasar", topK: 2 });
-		assert.deepEqual(hits.map((result) => result.sourceId), ["short", "long"]);
+		assert.deepEqual(
+			hits.map((result) => result.sourceId),
+			["short", "long"],
+		);
 		assert.ok(hits[0].score >= hits[1].score);
 		assert.ok(hits.every((result) => result.score >= 0 && Number.isFinite(result.score)));
 		assert.deepEqual(await retriever.retrieve({ query: "   ", topK: 2 }), []);
@@ -79,16 +92,23 @@ describe("search services", () => {
 				"Section",
 			);
 		const hits = await new BM25Retriever(db, "document").retrieve({ query: "quasar", topK: 10 });
-		assert.deepEqual(hits.map((result) => result.location.chunkIndex), [0, 1]);
+		assert.deepEqual(
+			hits.map((result) => result.location.chunkIndex),
+			[0, 1],
+		);
 		assert.ok(hits.every((result) => result.sourceId === "document" && result.sourceType === "document"));
 	});
 
 	it("routes search and vsearch to separate retrievers", async () => {
 		const lexicalHits = [hit("lexical", 2)];
 		const vectorHits = [hit("semantic", 0.9)];
-		const lexical = { retrieve: mock.fn(async (_request: { query: string; topK: number }) => lexicalHits) } satisfies Retriever;
-		const vector = { retrieve: mock.fn(async (_request: { query: string; topK: number }) => vectorHits) } satisfies Retriever;
-		const service = new SearchService(lexical, vector);
+		const lexical = {
+			retrieve: mock.fn(async (_request: { query: string; topK: number }) => lexicalHits),
+		} satisfies Retriever;
+		const vector = {
+			retrieve: mock.fn(async (_request: { query: string; topK: number }) => vectorHits),
+		} satisfies Retriever;
+		const service = createSearchService(lexical, vector);
 		const request = { query: "question", topK: 5 };
 
 		assert.deepEqual(await service.search(request), lexicalHits);
@@ -106,14 +126,7 @@ describe("search services", () => {
 			"hash",
 			"2026-01-01T00:00:00.000Z",
 		);
-		db.prepare("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)").run(
-			"document",
-			0,
-			"semantic text",
-			1,
-			1,
-			null,
-		);
+		db.prepare("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)").run("document", 0, "semantic text", 1, 1, null);
 		const queries: string[] = [];
 		const provider: EmbeddingProvider = {
 			identity: "test/fixed-2d:v1",
@@ -165,22 +178,81 @@ describe("search services", () => {
 			/incomplete/i,
 		);
 		assert.equal(queryCalls, 0);
+		await assert.rejects(
+			createSearchService(new BM25Retriever(db, "document"), new VectorRetriever(index, provider, "document")).query(
+				{
+					query: "meaning",
+					topK: 1,
+				},
+			),
+			/incomplete/i,
+		);
+		assert.equal(queryCalls, 0);
+	});
+
+	it("query fuses BM25 and vector chunk rankings while preserving coordinates", async () => {
+		db.prepare("INSERT INTO documents VALUES (?, ?, ?, ?)").run("doc", "doc.md", "hash", "2026-01-01");
+		db.prepare("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)").run("doc", 0, "quasar", 1, 1, "First");
+		db.prepare("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)").run("doc", 1, "semantic", 2, 2, "Second");
+		const queries: string[] = [];
+		const provider: EmbeddingProvider = {
+			identity: "test/query-2d:v1",
+			dimensions: 2,
+			async embedDocuments(texts) {
+				return texts.map((text) => (text === "semantic" ? [1, 0] : [0, 1]));
+			},
+			async embedQuery(query) {
+				queries.push(query);
+				return [1, 0];
+			},
+		};
+		const index = new VectorIndex(db, provider);
+		await index.syncEmbeddings("document");
+		const service = createSearchService(
+			new BM25Retriever(db, "document"),
+			new VectorRetriever(index, provider, "document"),
+		);
+		const request = { query: "quasar", topK: 2 };
+		assert.deepEqual(
+			(await service.search(request)).map((hit) => hit.location.chunkIndex),
+			[0],
+		);
+		const hits = await service.query(request);
+		const vectorHits = await service.vsearch(request);
+		assert.deepEqual(hits, [
+			{ ...vectorHits[1], score: 0.75 },
+			{ ...vectorHits[0], score: 0.375 },
+		]);
+		assert.deepEqual(
+			hits.map((hit) => hit.location.chunkIndex),
+			[0, 1],
+		);
+		assert.equal(hits[0].location.startLine, 1);
+		assert.equal(hits[0].location.section, "First");
+		assert.deepEqual(queries, ["quasar", "quasar"]);
+		assert.deepEqual(await service.query({ query: " ", topK: 2 }), []);
+		assert.deepEqual(await service.query({ query: "quasar", topK: 0 }), []);
+		assert.equal(queries.length, 2);
 	});
 
 	it("does not silently fall back when vector retrieval fails", async () => {
-		const lexical = { retrieve: mock.fn(async (_request: { query: string; topK: number }) => [hit("lexical", 2)]) } satisfies Retriever;
+		const lexical = {
+			retrieve: mock.fn(async (_request: { query: string; topK: number }) => [hit("lexical", 2)]),
+		} satisfies Retriever;
 		const vector: Retriever = {
 			async retrieve() {
 				throw new Error("vector index is not ready");
 			},
 		};
-		const service = new SearchService(lexical, vector);
+		const service = createSearchService(lexical, vector);
 		await assert.rejects(service.vsearch({ query: "question", topK: 5 }), /not ready/);
 		assert.equal(lexical.retrieve.mock.callCount(), 0);
 	});
 
 	it("supports a BM25-only service while making vsearch unavailability explicit", async () => {
-		const lexical = { retrieve: mock.fn(async (_request: { query: string; topK: number }) => [hit("lexical", 2)]) } satisfies Retriever;
+		const lexical = {
+			retrieve: mock.fn(async (_request: { query: string; topK: number }) => [hit("lexical", 2)]),
+		} satisfies Retriever;
 		const service = new SearchService(lexical);
 		assert.equal((await service.search({ query: "question", topK: 5 }))[0].sourceId, "lexical");
 		await assert.rejects(service.vsearch({ query: "question", topK: 5 }), /embedding|vector|configured/i);

@@ -1,16 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { Agent, fetch as embeddingFetch, ProxyAgent } from "undici";
 import type { EmbeddingProvider } from "./provider.ts";
-
-export interface JinaEmbeddingOptions {
-	apiKey: string;
-	model?: "jina-embeddings-v3";
-	dimensions?: number;
-	/** Explicit HTTP(S) proxy for Jina only; does not replace Pi's global HTTP dispatcher. */
-	proxyUrl?: string;
-	/** Injectable transport for offline verification; defaults to an owned undici connection. */
-	fetch?: typeof fetch;
-}
+import type { JinaEmbeddingOptions } from "./types.ts";
 
 /** Jina v3 HTTP adapter. 10-second attempts, up to three retries, and a 20-second pause after HTTP 429. */
 export class JinaEmbeddingProvider implements EmbeddingProvider {

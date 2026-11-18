@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { createEmbeddingProvider } from "../../src/config.ts";
+import { isSearchMode } from "../../src/search/modes.ts";
 import { BeirDataset } from "./beir.ts";
 import { runRetrievalEval } from "./runner.ts";
 
@@ -17,11 +18,11 @@ const { values } = parseArgs({
 });
 if (!values.dataset || !values.output) {
 	throw new Error(
-		"Usage: node eval/rag/run.ts --dataset <BEIR directory> --output <new directory> [--top-k 10] [--split test] [--mode search|vsearch] [--builds <cache root>]",
+		"Usage: node eval/rag/run.ts --dataset <BEIR directory> --output <new directory> [--top-k 10] [--split test] [--mode search|vsearch|query] [--builds <cache root>]",
 	);
 }
-if (values.mode !== "search" && values.mode !== "vsearch") throw new Error("Mode must be search or vsearch.");
-const embedding = values.mode === "vsearch" ? createEmbeddingProvider() : undefined;
+if (!isSearchMode(values.mode)) throw new Error("Mode must be search, vsearch or query.");
+const embedding = values.mode !== "search" ? createEmbeddingProvider() : undefined;
 try {
 	await runRetrievalEval({
 		loader: new BeirDataset(values.dataset, values.split),

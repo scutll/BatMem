@@ -2,26 +2,7 @@ import { appendFile, open, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { MemorySample } from "./dataset.ts";
 import { loadBuildManifest, loadEvaluationRun, loadPreparedSample } from "./runner.ts";
-
-export interface JudgePrompts {
-	repository: string;
-	commit: string;
-	source: string;
-	sha256: string;
-	templates: Record<string, string>;
-}
-export interface JudgeResponse {
-	text: string;
-	model: string;
-	usage: unknown;
-}
-export interface Judgment {
-	question_id: string;
-	question_type: string;
-	abstention: boolean;
-	label: boolean;
-	response: JudgeResponse;
-}
+import type { JudgePrompts, JudgeResponse, Judgment } from "./types.ts";
 
 /** Read vendored templates extracted from the official function at the recorded commit. No network fetch at runtime. */
 export async function loadJudgePrompts(): Promise<JudgePrompts> {

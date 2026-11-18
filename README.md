@@ -54,6 +54,7 @@ Embedding 每次请求超时为 10 秒；网络错误、超时及 HTTP 408/429/5
 | --- | --- |
 | `search`（默认） | BM25 关键词检索，不需要 embedding 密钥 |
 | `vsearch` | 向量语义检索，需要密钥及完整的向量索引 |
+| `query` | 并发召回 BM25 与 embedding；当前 Processor 直接返回 embedding hits，需要完整向量索引 |
 
 例如，让 Agent 使用 `rag_search` 并指定以下参数：
 
@@ -75,6 +76,8 @@ node eval/rag/run.ts --dataset "<BEIR目录>" --output "eval/rag/runs/vector-01"
 
 BM25 对照实验使用 `--mode search` 和另一个输出目录。两种模式都导出相同格式的 `retrieval.jsonl`，供现有 Python 评分程序读取，具体评分方式见 [Eval.md](docs/Eval.md)。
 
+双路召回使用 `--mode query`，PowerShell 使用 `-Mode query`；LongMemEval 使用 `--retrieval query` 或 `-Retrieval query`。当前 query 不融合、不重排，输出与相同配置的 vsearch 一致。两路均成功后才进入 Processor，任一路失败会等待全部路径结束再报错，不降级。
+
 CLI 默认把可复用索引保存在 `eval/rag/builds/<语料指纹>/index.db`。同一语料首次完整生成文档向量，后续运行复用；中断后换一个新的输出目录重跑，会补建缺失向量。改变 Top-K 或 split 不重建语料向量，查询文本仍在每次运行时编码。可通过 `--builds` 更改缓存根目录。
 
 准备好 Python 评分环境后，也可以一键检索、评分并显示中文指标：
@@ -85,7 +88,72 @@ CLI 默认把可复用索引保存在 `eval/rag/builds/<语料指纹>/index.db`�
 
 过程显示阶段提示和单行刷新进度；输出重定向到文件时改为间隔日志。每次评测结果单独保存到 `eval/rag/runs/`，不会覆盖上一轮结果。
 
+## Query 运行架构（待实现）
+
+当前可运行模式为 `search` 和 `vsearch`。计划中的 `query` 在公共搜索入口中组合 Recall 与 Processor：Recall 并行执行已注册的全部召回任务，汇总后一次性交给 Processor，最终仍返回 `RetrievalHit[]`。召回后的处理逻辑留空。
+
+```text
+工具 / Eval → SearchService.query({ query, topK })
+  → QueryRecall 抽象类的具体实现
+      ├─ RecallTask { path: "bm25", run: async (request) => ... }
+      ├─ RecallTask { path: "embedding", run: async (request) => ... }
+      └─ 其他已注册的 RecallTask
+      → 并行运行，等待全部路径结束
+      → 汇总 [{ path, hits }, ...]，保留空结果及各路径排名
+  → QueryProcessor.process(原始请求, 全部路径结果)
+      → 处理逻辑：留空
+  → RetrievalHit[] → 工具结果 / Eval 导出
+```
+
+### 设置召回任务的 run
+
+`QueryRecall` 是抽象类，负责 `addTask()`、任务执行和结果汇总，不固定召回算法或路径数量。具体实现类在构造时注册任务，每条路径使用唯一名称。下面是初始双路组合的设计示例，相关类尚未实现：
+
+```ts
+class BM25EmbeddingRecall<T extends RetrievalHit = RetrievalHit> extends QueryRecall<T> {
+    constructor(bm25: Retriever<T>, vector: Retriever<T>) {
+        super();
+        this.addTask({
+            path: "bm25",
+            run: async (request) => {
+                return bm25.retrieve(request);
+            },
+        });
+        this.addTask({
+            path: "embedding",
+            run: async (request) => {
+                return vector.retrieve(request);
+            },
+        });
+    }
+}
+```
+
+`run` 的类型为 `(request: RetrievalQuery) => Promise<T[]>`。请求包含 `query` 和 `topK`，每条路径收到独立的请求副本。需要改写查询或调整单路结果时，在对应匿名函数内添加逻辑；增加召回路径时继续注册任务，不修改公共调度流程。同一组合的路径使用相同来源的索引：会话摘要或文档块。
+
+### 等待全部路径并进入 Processor
+
+Recall 捕获本次任务列表，使用 `Promise.allSettled()` 并行执行所有 `run`，等待全部结束后检查错误。任一路失败则报告错误，不调用 Processor；全部成功则按注册顺序生成 `RecallResult[]`。这不是多线程执行 SQLite，而是允许异步任务的等待时间重叠。
+
+Processor 使用接口与实现类模型，初始化时与所需的 Recall 组合装配。接口如下，具体处理逻辑留空：
+
+```ts
+interface QueryProcessor<T extends RetrievalHit = RetrievalHit> {
+    process(request: RetrievalQuery, results: RecallResult<T>[]): Promise<T[]>;
+}
+```
+
+其中 `RecallResult<T>` 为 `{ path: string; hits: T[] }`。Processor 一次接收原始查询和所有路径的结果，可以识别路径名称、读取各路排名、分数、正文及来源坐标；对应实现类验证所需路径是否存在。单路正常返回 `[]` 时，仍将该路径交给 Processor。
+
+### Eval 接入
+
+Eval 继续通过现有异步搜索接口获得最终 `RetrievalHit[]`，不感知内部任务调度。计划增加 query 模式的参数校验与分派，并让它复用 vsearch 的密钥配置、向量构建和就绪检查；建库、结果导出和评分流程沿用现有接口。运行记录补充 Recall 路径组合、Processor 标识与相关实现哈希。query 的 CLI 接入尚未实现。
+
+完整契约与集成边界见 [Memories.md](docs/Memories.md#query-混合检索设计待实现)。
+
 ## Project Structure
+
+接口和实现分文件维护：`search/recall.ts` 只定义抽象基类，`bm25-embedding-recall.ts` 定义具体组合；`processor.ts` 只定义接口，`embedding-query-processor.ts` 定义透传实现。搜索数据契约与组合接口在 `search/types.ts`，运行时模式校验在 `search/modes.ts`。Embedding、扩展选项与两套 Eval 的配置和结果接口分别放在对应的 `types.ts`，调用方直接从类型文件导入。
 
 ```text
 BatMem/
@@ -99,6 +167,7 @@ BatMem/
 │   ├── longmem/                      # Cross-session answer evaluation
 │   │   ├── test/                     # Offline evaluation tests
 │   │   ├── dataset.ts                # Dataset contract
+│   │   ├── types.ts                  # Build, session, run and judge contracts
 │   │   ├── judge-prompts.json        # Official judge templates
 │   │   ├── judge.ts                  # Answer scoring
 │   │   ├── longmemeval.ts            # LongMemEval adapter
@@ -112,6 +181,7 @@ BatMem/
 │       ├── beir.ts                   # BEIR dataset adapter
 │       ├── build.ts                  # Reusable corpus index
 │       ├── dataset.ts                # Dataset contract
+│       ├── types.ts                  # Build and retrieval evaluation contracts
 │       ├── progress.ts               # CLI progress display
 │       ├── run.ts                    # Retrieval CLI
 │       ├── runbeir.ps1               # Windows workflow
@@ -122,6 +192,7 @@ BatMem/
 │   ├── embedding/                    # Text encoding and vector storage
 │   │   ├── jina.ts                   # Jina HTTP provider
 │   │   ├── provider.ts               # Provider contract
+│   │   ├── types.ts                  # Provider options and vector index records
 │   │   └── vector-index.ts           # SQLite vector index
 │   ├── memory/                       # Session memory
 │   │   ├── service.ts                # Session sync and recall
@@ -134,12 +205,18 @@ BatMem/
 │   ├── search/                       # Shared retrieval strategies
 │   │   ├── bm25.ts                   # FTS5 keyword retrieval
 │   │   ├── rows.ts                   # SQL result mapping
+│   │   ├── recall.ts                 # Abstract recall scheduler
+│   │   ├── bm25-embedding-recall.ts   # Default recall implementation
+│   │   ├── processor.ts              # Processor contract
+│   │   ├── embedding-query-processor.ts # Embedding passthrough implementation
+│   │   ├── modes.ts                  # Runtime mode validation
 │   │   ├── service.ts                # Search mode interface
 │   │   ├── types.ts                  # Retrieval contracts
 │   │   └── vector.ts                 # Vector query retrieval
 │   ├── storage/
 │   │   └── db.ts                     # SQLite schema and connection
 │   ├── config.ts                     # Embedding configuration
+│   ├── types.ts                      # Extension composition options
 │   └── index.ts                      # Extension entry point
 ├── test/                             # Core offline tests
 │   ├── CONTRACT.md                   # Test contract
@@ -148,6 +225,8 @@ BatMem/
 │   ├── memory.test.ts
 │   ├── rag.test.ts
 │   ├── search.test.ts
+│   ├── query.test.ts
+│   ├── extension.test.ts
 │   └── vector.test.ts
 ├── .env.example                      # Embedding settings template
 ├── .gitignore

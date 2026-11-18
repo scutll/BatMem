@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, it } from "node:test";
+import { afterEach, beforeEach, it, mock } from "node:test";
+import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
 import { openDatabase } from "../../../src/storage/db.ts";
+import { mockReranking } from "../../../test/helpers/reranking.ts";
 import { BeirDataset, loadQueries } from "../beir.ts";
 import type { DatasetLoader } from "../dataset.ts";
 import { runRetrievalEval } from "../runner.ts";
@@ -12,6 +14,7 @@ let root: string;
 let dataset: string;
 let output: string;
 beforeEach(async () => {
+	mockReranking(mock);
 	root = await mkdtemp(join(tmpdir(), "batmem-eval-"));
 	dataset = join(root, "dataset");
 	output = join(root, "run");
@@ -41,6 +44,7 @@ beforeEach(async () => {
 	);
 });
 afterEach(async () => {
+	mock.restoreAll();
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -111,4 +115,77 @@ it("rejects invalid records, unknown query references and duplicate judgments", 
 	await assert.rejects(loadQueries(queries, qrels), /Duplicate qrel/);
 	await writeFile(queries, '{"_id":42,"text":"invalid"}');
 	await assert.rejects(loadQueries(queries, qrels), /queries.jsonl:1/);
+});
+
+it("query reuses vector builds and exports fused rankings with explicit pipeline metadata", async () => {
+	let encoded = 0;
+	let queries = 0;
+	const embedding: EmbeddingProvider = {
+		identity: "test/beir-query:v1",
+		dimensions: 2,
+		async embedDocuments(texts) {
+			encoded += texts.length;
+			return texts.map((text) => (text === "transactions" ? [1, 0] : [0, 1]));
+		},
+		async embedQuery() {
+			queries++;
+			return [1, 0];
+		},
+	};
+	const builds = join(root, "builds");
+	const baseline = join(root, "bm25");
+	const vectorRun = join(root, "vector");
+	const loader = new BeirDataset(dataset);
+	await runRetrievalEval({ loader, output: baseline, builds, topK: 2 });
+	await runRetrievalEval({ loader, output: vectorRun, builds, topK: 2, mode: "vsearch", embedding });
+	await runRetrievalEval({ loader, output, builds, topK: 2, mode: "query", embedding });
+	assert.equal(encoded, 2);
+	assert.equal(queries, 4);
+	const text = await readFile(join(output, "retrieval.jsonl"), "utf8");
+	const rows = text.trim().split("\n").map((line) => JSON.parse(line));
+	assert.deepEqual(rows[0].hits.map((hit: { document_id: string }) => hit.document_id), ["doc/string-1", "d2"]);
+	assert.deepEqual(rows[1].hits.map((hit: { document_id: string }) => hit.document_id), ["d2", "doc/string-1"]);
+	assert.deepEqual(rows.map((row) => row.hits.map((hit: { score: number }) => hit.score)), [
+		[0.75, 0.375],
+		[0.75, 0.375],
+	]);
+	assert.notEqual(text, await readFile(join(vectorRun, "retrieval.jsonl"), "utf8"));
+	assert.notEqual(text, await readFile(join(baseline, "retrieval.jsonl"), "utf8"));
+	const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+	const lexicalManifest = JSON.parse(await readFile(join(baseline, "manifest.json"), "utf8"));
+	assert.equal(manifest.build.fingerprint, lexicalManifest.build.fingerprint);
+	assert.equal(manifest.build.reused, true);
+	assert.equal(manifest.retriever, "query");
+	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "rrf-rerank-blend" });
+	assert.match(manifest.score, /RRF rank.*rerank/);
+	assert.ok(Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/recall.ts")));
+	assert.ok(
+		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/bm25-embedding-recall.ts")),
+	);
+	assert.ok(
+		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/embedding-query-processor.ts")),
+	);
+
+	const recoveredRun = join(root, "recovered-query");
+	let attempts = 0;
+	await runRetrievalEval({
+		loader,
+		output: recoveredRun,
+		builds,
+		mode: "query",
+		embedding: {
+			...embedding,
+			async embedQuery() {
+				if (++attempts === 1) throw new Error("query embedding unavailable");
+				return [1, 0];
+			},
+		},
+	});
+	assert.equal(attempts, 3);
+	assert.equal(JSON.parse(await readFile(join(recoveredRun, "manifest.json"), "utf8")).status, "complete");
+	assert.equal(encoded, 2);
+	await assert.rejects(
+		runRetrievalEval({ loader, output: join(root, "missing-provider"), mode: "query" }),
+		/requires an embedding provider/,
+	);
 });

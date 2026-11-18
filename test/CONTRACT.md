@@ -7,10 +7,12 @@ sqlite-vec 查询；摘要与 embedding 响应使用固定 Mock，不读取真�
 从 BatMem 根目录运行：
 
 ```powershell
-node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts
+node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts test/query.test.ts test/extension.test.ts
 ```
 
 ## 公共接口
+
+类型从对应契约文件导入：搜索为 `src/search/types.ts` 和 `src/search/processor.ts`，Embedding 配置及索引记录为 `src/embedding/types.ts`，扩展选项为 `src/types.ts`，Eval 运行接口为各自目录下的 `types.ts`。`QueryRecall` 抽象基类位于 `recall.ts`，具体组合位于 `bm25-embedding-recall.ts`；Processor 具体实现位于 `embedding-query-processor.ts`。实现文件不再兼容转导出已迁移的接口。
 
 - `openDatabase(path)` 创建父目录并初始化文本、FTS5 和向量元数据表，返回由调用方关闭的
   `node:sqlite` 连接。
@@ -18,7 +20,7 @@ node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embed
   接收完整线性 Session 快照。首次摘要使用全部有效消息，增量摘要只使用旧摘要和游标之后的消息；
   模型失败不推进摘要游标。已配置 provider 时，摘要保存后补建向量；无新消息时也补建缺失向量。
   创建服务时通过 `ready` 等待已有摘要的向量补建。`searchSummaries(request, mode?)` 异步返回
-  BM25（默认）或向量检索结果。
+  BM25（默认）、向量检索或 query 结果；query 等待启动向量补建。
 - `MemoryService.readMessages(sessionId, keyword)` 按字面子串返回最近三条 User/Assistant 原文，
   不返回 Tool Result。
 - `RAGService.scanDocuments()` 递归维护 Markdown 文档；`replaceDocumentIndex()` 可直接写入已准备的
@@ -35,6 +37,20 @@ node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embed
 - `VectorRetriever` 在 query 编码前检查索引状态，编码后再次检查，再执行来源限定的向量查询。
 - `SearchService.search()` 只调用 BM25 Retriever；`vsearch()` 只调用 Vector Retriever。向量未配置
   或失败时明确报错，不静默返回 BM25 结果。
+- `SearchService.query()` 默认使用 `BM25EmbeddingRecall` 并发执行 BM25 与 embedding 任务，
+  `QueryRecall` 抽象类允许子类注册任意数量的 `{ path, run: async request => hits }`。
+  各路请求独立，全部结束后按注册顺序汇总 `RecallResult[]`；失败时汇总错误，不执行 Processor。
+- `QueryProcessor.process(request, results)` 接收原始请求与全部成功路径。
+  `EmbeddingQueryProcessor` 每路先按来源身份去重、保留首次命中，再以去重后的排名计算
+  `1 / (60 + rank)`；跨路累加并记录最好排名，第 1 名加 `0.05`、第 2～3 名加 `0.02`，
+  奖励只加一次，按融合分降序选取前 `max(40, topK)` 个候选，不修改输入。
+  构造时可注入 reranker，否则沿用 embedding 的 Jina 密钥和代理配置创建；没有密钥时为空。
+  非空候选必须配置 reranker；请求全部候选的分数，以响应 index 映射回候选。
+  最终分数为 `alpha / r + (1 - alpha) * rerankScore`，r 是从 1 开始的 RRF 排名；
+  排名 1～3 的 alpha 为 `0.75`，4～10 为 `0.60`，其余为 `0.40`。
+  混合后重新排序并返回 topK。Query 和 Search 测试注入离线 reranker，覆盖响应乱序和权重边界。
+- 普通工具与真实 Pi SDK 评测使用注入的离线 provider；评测模式固定，模型工具参数不能覆盖。
+  扩展不关闭调用方提供的 provider，evalMode 不补建向量、不保存问答摘要。
 
 ## 结果与测试边界
 

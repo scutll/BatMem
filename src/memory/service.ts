@@ -1,16 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { EmbeddingProvider } from "../embedding/provider.ts";
+import { VectorIndex } from "../embedding/vector-index.ts";
 import { BM25Retriever } from "../search/bm25.ts";
 import { SearchService } from "../search/service.ts";
+import type { RetrievalHit, RetrievalQuery, SearchMode } from "../search/types.ts";
 import { VectorRetriever } from "../search/vector.ts";
-import type {
-	IndexedMessage,
-	SessionSnapshot,
-	SessionSummary,
-	SummaryGenerator,
-} from "./types.ts";
-import type { RetrievalHit, RetrievalQuery } from "../search/types.ts";
-import { VectorIndex } from "../embedding/vector-index.ts";
+import type { IndexedMessage, SessionSnapshot, SessionSummary, SummaryGenerator } from "./types.ts";
 
 /** Session indexing and retrieval independent of extension events and concrete model providers. */
 export class MemoryService {
@@ -68,14 +63,14 @@ export class MemoryService {
 
 	/**
 	 * Search current summaries. `search` uses FTS5 BM25; `vsearch` embeds the query and
-	 * retrieves stored summary vectors. A missing or incomplete vector index rejects.
+	 * retrieves stored summary vectors. `query` recalls both and currently returns embedding hits.
+	 * A missing or incomplete vector index rejects vector and query searches.
 	 */
-	async searchSummaries(request: RetrievalQuery, mode: "search" | "vsearch" = "search"): Promise<RetrievalHit[]> {
-		if (mode === "vsearch") {
+	async searchSummaries(request: RetrievalQuery, mode: SearchMode = "search"): Promise<RetrievalHit[]> {
+		if (mode !== "search") {
 			await this.ready.catch(() => {});
-			return this.search.vsearch(request);
 		}
-		return this.search.search(request);
+		return this.search[mode](request);
 	}
 
 	/**

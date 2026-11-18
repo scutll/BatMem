@@ -17,7 +17,7 @@ param(
     [ValidatePattern('^[a-zA-Z0-9_-]+$')]
     [string]$Split = 'test',
 
-    [ValidateSet('search', 'vsearch')]
+    [ValidateSet('search', 'vsearch', 'query')]
     [string]$Mode = 'search',
 
     [string]$BuildsDirectory = (Join-Path $PSScriptRoot 'builds')

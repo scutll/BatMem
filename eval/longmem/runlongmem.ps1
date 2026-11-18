@@ -26,7 +26,7 @@ param(
     [ValidateSet('memory', 'no-memory')]
     [string]$Mode = 'memory',
 
-    [ValidateSet('search', 'vsearch')]
+    [ValidateSet('search', 'vsearch', 'query')]
     [string]$Retrieval = 'search',
 
     [string]$JudgeProvider,
@@ -102,7 +102,7 @@ Write-Host "Model: $Provider/$Model; mode: $Mode; retrieval: $Retrieval; questio
 if ($Types) { Write-Host "Types: $Types" }
 Write-Host 'Answer and judge make real model calls.'
 if ($Mode -eq 'memory') { Write-Host 'New summary builds call the model once per historical session; cached summaries are reused.' }
-if ($Retrieval -eq 'vsearch' -and $Mode -eq 'memory') { Write-Host 'Vector build calls Jina only for missing summary embeddings.' }
+if ($Retrieval -ne 'search' -and $Mode -eq 'memory') { Write-Host 'Vector build calls Jina only for missing summary embeddings.' }
 
 $stages = @()
 if (-not $ResumeDirectory) { $stages += 'prepare' }

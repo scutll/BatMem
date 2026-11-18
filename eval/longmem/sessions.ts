@@ -1,3 +1,4 @@
+import type { ImportedSession } from "./types.ts";
 /**
  * 导入数据集数据，并构造SessionJSONL文件
  * 按照每个测试问题一个文件夹分隔，文件夹内是测试问题所需要的多个Session JSONL文件
@@ -10,8 +11,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	CURRENT_SESSION_VERSION,
-	SessionManager,
 	type FileEntry,
+	SessionManager,
 	type SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { SessionSnapshot } from "../../src/memory/types.ts";
@@ -75,14 +76,6 @@ export function createSessionEntries(history: HistorySession, cwd: string, sessi
 		parentId = id;
 	}
 	return entries;
-}
-
-export interface ImportedSession {
-	originalId: string;
-	sessionId: string;
-	path: string;
-	messageCount: number;
-	sha256: string;
 }
 
 /** Write completed files with opaque names: evidence-bearing dataset IDs never appear in Agent-visible paths. */

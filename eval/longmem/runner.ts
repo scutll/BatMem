@@ -1,70 +1,30 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { clearLine, cursorTo } from "node:readline";
-import { openDatabase } from "../../src/storage/db.ts";
 import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
+import { VectorIndex } from "../../src/embedding/vector-index.ts";
 import { MemoryService } from "../../src/memory/service.ts";
 import type { SummaryGenerator } from "../../src/memory/types.ts";
-import { VectorIndex } from "../../src/embedding/vector-index.ts";
+import type { SearchMode } from "../../src/search/types.ts";
+import { openDatabase } from "../../src/storage/db.ts";
 import type { MemoryDatasetLoader, MemorySample } from "./dataset.ts";
-import type { QuestionResult, TraceEvent } from "./pi.ts";
-import type { ImportedSession } from "./sessions.ts";
 import { loadSessionSnapshot, parseHistoryDate, writeHistorySessions } from "./sessions.ts";
-
-export interface PreparedSample {
-	sample: MemorySample;
-	directory: string;
-	project: string;
-	sessions: ImportedSession[];
-}
-
-/** Inputs that can change indexed summaries or their SQLite representation. */
-export interface MemoryBuildConfig {
-	model: string;
-	summaryPromptSha256: string;
-	syncMode: "session-final";
-}
-
-/** Limit is applied after optional type filtering and belongs to a run, not a cached build. */
-export interface BuildSelection {
-	limit: number;
-	types: string[];
-}
-
-/** Append-only cache description. The fingerprint is independent of a run's limit and cache growth. */
-export interface MemoryBuildManifest {
-	status: "prepared";
-	buildFormat: number;
-	fingerprint: string;
-	source: string;
-	sourceSha256: string;
-	selection: { types: string[] };
-	buildConfig: MemoryBuildConfig;
-	sampleDirectories: string[];
-	timeConvention: string;
-	codeSha256: Record<string, string>;
-}
+import type {
+	AnswerQuestion,
+	AnswerRequest,
+	BuildSelection,
+	EvaluationRunManifest,
+	MemoryBuildConfig,
+	MemoryBuildManifest,
+	PreparedBuild,
+	PreparedSample,
+	TraceEvent,
+} from "./types.ts";
 
 /** Bump only when persisted Session/SQLite/summary-input formats become incompatible with existing builds. */
 const BUILD_FORMAT = 1;
-
-/** A run points to a build cache and owns its answer artifacts and disposable SQLite copies. */
-export interface EvaluationRunManifest {
-	status: "prepared";
-	buildDirectory: string;
-	buildFingerprint: string;
-	sampleDirectories: string[];
-	retrieval?: "search" | "vsearch";
-	embedding?: { identity: string; dimensions: number };
-}
-
-export interface PreparedBuild {
-	directory: string;
-	manifest: MemoryBuildManifest;
-	sampleDirectories: string[];
-}
 
 /** Store the question and reference outside the Pi cwd; only imported history is indexed. */
 export async function prepareSample(sample: MemorySample, directory: string): Promise<PreparedSample> {
@@ -87,6 +47,7 @@ async function collectCodeHashes(): Promise<Record<string, string>> {
 	const hashes: Record<string, string> = {};
 	for (const name of [
 		"./dataset.ts",
+		"./types.ts",
 		"./longmemeval.ts",
 		"./sessions.ts",
 		"../../src/storage/db.ts",
@@ -94,12 +55,22 @@ async function collectCodeHashes(): Promise<Record<string, string>> {
 		"../../src/memory/types.ts",
 		"../../src/memory/summary.ts",
 		"../../src/embedding/provider.ts",
+		"../../src/embedding/types.ts",
 		"../../src/embedding/jina.ts",
 		"../../src/embedding/vector-index.ts",
 		"../../src/search/types.ts",
 		"../../src/search/bm25.ts",
 		"../../src/search/vector.ts",
 		"../../src/search/service.ts",
+		"../../src/search/recall.ts",
+		"../../src/search/processor.ts",
+		"../../src/search/bm25-embedding-recall.ts",
+		"../../src/search/embedding-query-processor.ts",
+		"../../src/search/modes.ts",
+		"../../src/index.ts",
+		"../../src/types.ts",
+		"./pi.ts",
+		"./run.ts",
 		"../../src/search/rows.ts",
 	])
 		hashes[name] = await sha256File(new URL(name, import.meta.url));
@@ -283,10 +254,10 @@ export async function prepareBuild(
 export async function createEvaluationRun(
 	output: string,
 	build: PreparedBuild,
-	retrieval: "search" | "vsearch" = "search",
+	retrieval: SearchMode = "search",
 	embedding?: EmbeddingProvider,
 ): Promise<EvaluationRunManifest> {
-	if (retrieval === "vsearch" && !embedding) throw new Error("vsearch requires an embedding provider.");
+	if (retrieval !== "search" && !embedding) throw new Error(`${retrieval} requires an embedding provider.`);
 	const root = resolve(output);
 	await mkdir(dirname(root), { recursive: true });
 	await mkdir(root);
@@ -296,6 +267,9 @@ export async function createEvaluationRun(
 		buildFingerprint: build.manifest.fingerprint,
 		sampleDirectories: build.sampleDirectories,
 		retrieval,
+		queryPipeline:
+			retrieval === "query" ? { recallPaths: ["bm25", "embedding"], processor: "embedding-passthrough" } : undefined,
+		codeSha256: await collectCodeHashes(),
 		embedding: embedding ? { identity: embedding.identity, dimensions: embedding.dimensions } : undefined,
 	};
 	await writeFile(join(root, "run-manifest.json"), JSON.stringify(manifest, null, 2), { flag: "wx" });
@@ -341,10 +315,21 @@ export function reconcileMemoryBuild(prepared: PreparedSample, repair: boolean):
 	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
 	try {
 		const expected = new Set(prepared.sessions.map((session) => session.sessionId));
-		const actual = new Set(db.prepare("SELECT id FROM sessions").all().map((row) => String(row.id)));
+		const actual = new Set(
+			db
+				.prepare("SELECT id FROM sessions")
+				.all()
+				.map((row) => String(row.id)),
+		);
 		const missing = [...expected].filter((id) => !actual.has(id));
-		if (missing.length) throw new Error(`Memory build is missing ${missing.length} imported sessions: ${prepared.sample.id}`);
-		const summarized = new Set(db.prepare("SELECT session_id FROM summaries").all().map((row) => String(row.session_id)));
+		if (missing.length)
+			throw new Error(`Memory build is missing ${missing.length} imported sessions: ${prepared.sample.id}`);
+		const summarized = new Set(
+			db
+				.prepare("SELECT session_id FROM summaries")
+				.all()
+				.map((row) => String(row.session_id)),
+		);
 		const unsummarized = [...expected].filter((id) => !summarized.has(id));
 		if (unsummarized.length)
 			throw new Error(`Memory build is missing ${unsummarized.length} historical summaries: ${prepared.sample.id}`);
@@ -447,28 +432,17 @@ export async function buildMemoryVectors(prepared: PreparedSample, embedding: Em
 	}
 }
 
-export interface AnswerRequest {
-	project: string;
-	runtimeDirectory: string;
-	question: string;
-	date: string;
-	trace: TraceEvent[];
-}
-
-/** The run owns Pi files and a disposable copy of the indexed project. */
-export type AnswerQuestion = (request: AnswerRequest) => Promise<QuestionResult>;
-
 /** Execute fresh Agent questions against a run-local copy, leaving the reusable build untouched. */
 export async function runMemoryEval(
 	runDirectory: string,
 	build: PreparedBuild,
 	answer: AnswerQuestion,
 	mode: "memory" | "no-memory" = "memory",
-	retrieval: "search" | "vsearch" = "search",
+	retrieval: SearchMode = "search",
 	embedding?: EmbeddingProvider,
 ): Promise<void> {
-	if (mode === "memory" && retrieval === "vsearch" && !embedding)
-		throw new Error("vsearch requires an embedding provider.");
+	if (mode === "memory" && retrieval !== "search" && !embedding)
+		throw new Error(`${retrieval} requires an embedding provider.`);
 	const root = resolve(runDirectory);
 	const answersPath = join(root, `answers-${mode}.jsonl`);
 	await writeFile(answersPath, "", { flag: "wx" });
@@ -501,7 +475,7 @@ export async function runMemoryEval(
 				}
 				reconcileMemoryBuild({ ...prepared, project }, false);
 			}
-			if (mode === "memory" && retrieval === "vsearch" && embedding) {
+			if (mode === "memory" && retrieval !== "search" && embedding) {
 				const db = openDatabase(join(project, ".pi", "docs-memory", "index.db"));
 				try {
 					new VectorIndex(db, embedding).assertReady("memory", embedding);

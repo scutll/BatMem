@@ -3,10 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
-import { openDatabase } from "../../../src/storage/db.ts";
 import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
-import { MemoryService } from "../../../src/memory/service.ts";
 import { VectorIndex } from "../../../src/embedding/vector-index.ts";
+import { MemoryService } from "../../../src/memory/service.ts";
+import { openDatabase } from "../../../src/storage/db.ts";
 import { LongMemEvalDataset, parseSample } from "../longmemeval.ts";
 import {
 	buildMemory,
@@ -18,9 +18,8 @@ import {
 	prepareSample,
 	reconcileMemoryBuild,
 	runMemoryEval,
-	type MemoryBuildConfig,
-	type PreparedBuild,
 } from "../runner.ts";
+import type { MemoryBuildConfig, PreparedBuild } from "../types.ts";
 
 let root: string;
 let input: string;
@@ -244,6 +243,60 @@ it("reuses a summary build across search and vsearch and resumes failed vector b
 	assert.match(await readFile(join(vectorRun, "answers-memory.jsonl"), "utf8"), /"cat"/);
 });
 
+it("query reuses summaries and vectors and rejects incomplete indexes before answering", async () => {
+	const build = await prepareRun();
+	const prepared = await loadPreparedSample(build.directory, build.sampleDirectories[0]);
+	let summaries = 0;
+	let encoded = 0;
+	const embedding: EmbeddingProvider = {
+		identity: "test/longmem-query:v1",
+		dimensions: 2,
+		async embedDocuments(texts) {
+			encoded += texts.length;
+			return texts.map(() => [1, 0]);
+		},
+		async embedQuery() {
+			return [1, 0];
+		},
+	};
+	await buildMemory(prepared, async () => {
+		summaries++;
+		return "pet cat";
+	});
+	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
+	await assert.rejects(
+		createEvaluationRun(join(root, "no-provider"), build, "query"),
+		/requires an embedding provider/,
+	);
+	const incompleteRun = join(root, "incomplete-query");
+	await createEvaluationRun(incompleteRun, build, "query", embedding);
+	let answered = false;
+	const answer = async () => {
+		answered = true;
+		return { text: "cat", usage: [], elapsedMs: 1 };
+	};
+	await assert.rejects(runMemoryEval(incompleteRun, build, answer, "memory", "query", embedding), /questions failed/);
+	assert.equal(answered, false);
+	await buildMemoryVectors(prepared, embedding);
+	await buildMemoryVectors(prepared, embedding);
+	assert.equal(encoded, 1);
+	assert.equal(summaries, 1);
+	assert.equal(await prepareMemoryBuild(prepared, JSON.stringify(config)), false);
+	const queryRun = join(root, "complete-query");
+	const manifest = await createEvaluationRun(queryRun, build, "query", embedding);
+	assert.equal(manifest.buildFingerprint, build.manifest.fingerprint);
+	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "embedding-passthrough" });
+	assert.ok(manifest.codeSha256?.["../../src/search/recall.ts"]);
+	assert.ok(manifest.codeSha256["../../src/search/bm25-embedding-recall.ts"]);
+	assert.ok(manifest.codeSha256["../../src/search/embedding-query-processor.ts"]);
+	const sourcePath = join(prepared.project, ".pi", "docs-memory", "index.db");
+	const before = await readFile(sourcePath);
+	await runMemoryEval(queryRun, build, answer, "memory", "query", embedding);
+	assert.equal(answered, true);
+	assert.deepEqual(await readFile(sourcePath), before);
+	assert.match(await readFile(join(queryRun, "answers-memory.jsonl"), "utf8"), /cat/);
+});
+
 it("rejects old answer sessions in a build and removes only those sessions during repair", async () => {
 	const build = await prepareRun();
 	const prepared = await loadPreparedSample(build.directory, build.manifest.sampleDirectories[0]);
@@ -257,8 +310,12 @@ it("rejects old answer sessions in a build and removes only those sessions durin
 		await new VectorIndex(db, {
 			identity: "test/cleanup-2d:v1",
 			dimensions: 2,
-			async embedDocuments(texts) { return texts.map(() => [1, 0]); },
-			async embedQuery() { return [1, 0]; },
+			async embedDocuments(texts) {
+				return texts.map(() => [1, 0]);
+			},
+			async embedQuery() {
+				return [1, 0];
+			},
 		}).syncEmbeddings("memory");
 	} finally {
 		db.close();
@@ -277,7 +334,10 @@ it("rejects old answer sessions in a build and removes only those sessions durin
 	const verified = openDatabase(dbPath);
 	try {
 		assert.deepEqual(
-			verified.prepare("SELECT id FROM sessions").all().map((row) => row.id),
+			verified
+				.prepare("SELECT id FROM sessions")
+				.all()
+				.map((row) => row.id),
 			[prepared.sessions[0].sessionId],
 		);
 		assert.equal(verified.prepare("SELECT COUNT(*) AS n FROM summaries").get()?.n, 1);

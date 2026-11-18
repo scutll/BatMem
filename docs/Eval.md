@@ -14,7 +14,7 @@ BatMem 采用两层评测：**RAG Retrieval Eval** 检查共享检索模块的�
 | --- | --- |
 | `MemoryService` | `sessions` 保存会话来源，`messages` 保存消息文本，`summaries` 为每个会话保存一条当前摘要及处理位置 |
 | `RAGService` | 扫描 Markdown，以内容哈希判断变更，将文档和切块保存到 `documents / chunks` |
-| `SearchService` | 提供异步 `search()` 和 `vsearch()`，分别调用关键词与向量检索器 |
+| `SearchService` | 提供异步 `search()`、`vsearch()` 和 `query()`；query 并发召回后调用 Processor |
 | `VectorIndex` | 分批生成缺失向量，写入 `embeddings`；`embedding_config` 保存数据库当前使用的编码配置 |
 | `openDatabase()` | 初始化表、FTS5 全文索引及触发器；启用外键、WAL 和 5 秒锁等待 |
 
@@ -47,7 +47,7 @@ session_shutdown
 
 例如，上一轮已处理到消息 B，本轮新增 C、D，摘要输入就是“旧摘要 + C、D”；成功后处理位置推进到 D。摘要更新由扩展串行执行，避免旧任务覆盖新结果。
 
-启动时的文档扫描和摘要向量补建作为后台任务发起，自动注入读取当时可用的摘要索引。自动注入固定使用 BM25 Top-1，搜索范围包含本会话摘要，且没有相关性阈值。同一轮模型请求复用该候选；自动追加的证据仅存在于请求上下文。Agent 还可主动调用工具：
+启动时的文档扫描和摘要向量补建作为后台任务发起，自动注入默认使用 BM25 Top-1，可通过扩展的 memorySearchMode 改为 vsearch/query。搜索范围包含本会话摘要，且没有相关性阈值。同一轮模型请求复用该候选；自动追加的证据仅存在于请求上下文。Agent 还可主动调用工具：
 
 | 工具 | 当前行为 |
 | --- | --- |
@@ -73,6 +73,8 @@ memory_search / rag_search / RAG 评测
 
 `vsearch()` 将原始查询编码为向量，通过 sqlite-vec 对指定来源的已存向量做精确余弦距离扫描，以 `1 - distance` 作为分数降序排列。两条路径都返回文本、分数、来源 ID 和定位信息；不同算法的分数各自用于排序。
 
+`query()` 使用 `BM25EmbeddingRecall` 并发执行两路异步任务，各路收到独立的请求对象；`QueryRecall` 抽象类支持继续注册其他路径。所有任务结束后，成功结果以 `{ path, hits }[]` 交给 `QueryProcessor`。任一路失败则等待全部结束后报错，不执行 Processor。当前 `EmbeddingQueryProcessor` 原样返回 embedding hits，不融合或重排，因此相同配置下 query 与 vsearch 的排名、分数相同。每路 Top-K 沿用搜索请求，输出仍为 `RetrievalHit[]`。
+
 默认 embedding 配置为 Jina `jina-embeddings-v3`、1024 维、归一化向量；摘要和文档块使用 `retrieval.passage`，查询使用 `retrieval.query`，输入保持完整。配置读取 BatMem 根目录 `.env`，同名文件值优先于进程环境；`JINA_API_KEY` 启用向量能力，`HTTPS_PROXY / HTTP_PROXY` 配置其代理。
 
 文本变化通过数据库触发器更新 FTS 并使对应向量失效。`syncEmbeddings()` 默认每批 32 条，只补建缺失向量，保存前再次核对来源和正文。向量检索要求来源索引完整且编码配置匹配，否则报错。Jina 请求每次超时 10 秒，对可重试错误最多重试三次，HTTP 429 后等待 20 秒。
@@ -84,13 +86,13 @@ memory_search / rag_search / RAG 评测
 针对固定语料和查询，调用生产 `SearchService`，将前 K 项结果与相关性标注 Qrels 比较。该评测覆盖入库、检索和排序，评分阶段使用文档 ID。
 
 ```text
-BEIR → DatasetLoader → 构建或复用索引 → search / vsearch
+BEIR → DatasetLoader → 构建或复用索引 → search / vsearch / query
      → retrieval.jsonl + manifest.json → Python 评分 → 指标
 ```
 
 ### 检索方式选择
 
-CLI 参数为 `--mode search|vsearch`，PowerShell 对应 `-Mode`，默认 `search`。`search` 使用文本与 FTS 索引；`vsearch` 先补齐整个语料的文档向量，再逐条编码查询。运行清单的 `retriever` 记录所用方式。
+CLI 参数为 `--mode search|vsearch|query`，PowerShell 对应 `-Mode`，默认 `search`。`search` 使用文本与 FTS 索引；`vsearch` 和 `query` 先补齐整个语料的文档向量，再逐条编码查询。运行清单的 `retriever` 记录所用方式。query 额外记录 `queryPipeline`，包含召回路径和 `embedding-passthrough` Processor；输出分数仍是余弦相似度。新增 Recall/Processor 源码纳入运行代码哈希，不改变语料 build 指纹或评分流程。
 
 ### 当前构建缓存与恢复
 
@@ -161,7 +163,7 @@ prepare → build → answer → judge
 历史转换   摘要建库   新会话问答   正确性判定与汇总
 ```
 
-`--mode memory|no-memory` 控制是否加载 BatMem。`--retrieval search|vsearch` 独立选择摘要检索算法：自动注入和 `memory_search` 工具默认使用该算法，工具仍可显式指定 `mode`。`vsearch` 在 build 阶段补齐摘要向量，回答前验证索引完整；`no-memory` 不加载扩展或检索工具。
+`--mode memory|no-memory` 控制是否加载 BatMem。`--retrieval search|vsearch|query` 独立选择摘要检索算法：自动注入和 `memory_search` 固定使用 run 的算法，模型传入其他 `mode` 不会覆盖。`vsearch` 和 `query` 在 build 阶段补齐摘要向量，回答前验证索引完整；`no-memory` 不加载扩展或检索工具。
 
 ### 评测数据集来源
 
@@ -181,7 +183,7 @@ Judge 按题型套用本地保存的官方 Prompt，输入问题、参考答案�
 
 | 输出字段 | 含义 |
 | --- | --- |
-| `retrieval` | 本次记忆检索方式：`search`、`vsearch` 或无记忆的 `none` |
+| `retrieval` | 本次记忆检索方式：`search`、`vsearch`、`query` 或无记忆的 `none` |
 | `overall_accuracy` | 全部问题的正确比例 |
 | `task_averaged_accuracy` | 本次出现的各题型正确率的等权平均 |
 | `by_type` | 各题型的题数和正确率 |
@@ -212,7 +214,7 @@ Judge 通过 `question_id` 对齐已保存回答与参考答案；评分前校�
 
 `prepare` 将每段历史写成 Session Header 和顺序相连的消息 Entry，随机 ID 通过 `parentId` 串联。数据集的会话日期统一映射为 UTC；该会话所有消息共用这一时间，并保留原消息顺序。写入后通过 `SessionManager.open()` 回读校验。
 
-`build` 校验历史文件哈希，通过 `loadSessionSnapshot()` 加载历史，每个完整会话调用一次 `syncSession()`，以 `session-final` 方式生成一条摘要。每题全部摘要完成、数据库关闭后发布 `memory-ready.json`。若选择 `vsearch`，同一阶段再检查已有摘要向量并补建缺失部分；向量调用失败时，已完成摘要和向量批次留在 build 中，重跑 build 继续补建。回答前再次检查向量是否完整。
+`build` 校验历史文件哈希，通过 `loadSessionSnapshot()` 加载历史，每个完整会话调用一次 `syncSession()`，以 `session-final` 方式生成一条摘要。每题全部摘要完成、数据库关闭后发布 `memory-ready.json`。若选择 `vsearch` 或 `query`，同一阶段再检查已有摘要向量并补建缺失部分；向量调用失败时，已完成摘要和向量批次留在 build 中，重跑 build 继续补建。回答前再次检查向量是否完整。
 
 `answer` 将该题 build 数据库复制到 run 内，以 run 的 `project` 为 cwd，通过 `createEvaluationSession()` 以 `evalMode` 加载真实扩展，使用 Pi 默认系统 Prompt。扩展入口跳过问答同步、向量补建和文档扫描；Agent 仍可在副本上搜索历史摘要并读取消息。`memory_search` 在评测中固定使用 run 的检索模式，即使模型传入另一种 `mode`。新 Session 和 Agent 状态也写在 run 内，`runQuestion()` 保存最后一条正常完成的 assistant 文本。build 阶段会按导入的历史 Session ID 清理旧评测遗留的问答索引，answer 阶段在副本上再次检查历史 Session 和摘要完整性。
 
@@ -220,7 +222,7 @@ Judge 通过 `question_id` 对齐已保存回答与参考答案；评分前校�
 
 ### 构建复用与产物
 
-build 指纹包含数据集内容哈希、规范化题型筛选、摘要模型、摘要 Prompt 哈希、同步方式和构建格式版本，不包含检索模式。`search` 与 `vsearch` 因此复用同一批历史 Session 和摘要；向量模式只补建缺失向量。Limit 选择缓存样本的前缀：缩小可复用已有样本，扩大只追加缺失样本。代码哈希作为审计信息保存。run manifest 记录检索模式和 embedding 身份；分阶段运行及恢复必须与之匹配。
+build 指纹包含数据集内容哈希、规范化题型筛选、摘要模型、摘要 Prompt 哈希、同步方式和构建格式版本，不包含检索模式。`search`、`vsearch`、`query` 因此复用同一批历史 Session 和摘要；向量模式只补建缺失向量。Limit 选择缓存样本的前缀：缩小可复用已有样本，扩大只追加缺失样本。代码哈希作为审计信息保存。run manifest 记录检索模式、embedding 身份和创建 run 时的代码哈希；query 还记录 `queryPipeline`。分阶段运行及恢复的检索模式和 embedding 配置必须匹配，代码哈希用于审计。
 
 ```text
 eval/datasets/LongMemEval/builds/<fingerprint>/
@@ -274,6 +276,7 @@ python -m venv eval/.venv
 ```powershell
 .\eval\rag\runbeir.ps1 .\eval\datasets\BEIR\scifact -Mode search -TopK 10 -Split test
 .\eval\rag\runbeir.ps1 .\eval\datasets\BEIR\scifact -Mode vsearch -TopK 10 -Split test
+.\eval\rag\runbeir.ps1 .\eval\datasets\BEIR\scifact -Mode query -TopK 10 -Split test
 ```
 
 脚本自动创建 `eval/rag/runs/<数据集目录名>--<编号>`，可用 `-BuildsDirectory` 指定缓存根目录。分开执行检索与评分：
@@ -293,9 +296,10 @@ node eval/rag/run.ts --dataset eval/datasets/BEIR/scifact --mode search --output
 ```powershell
 .\eval\longmem\runlongmem.ps1 -DatasetPath .\eval\datasets\LongMemEval\longmemeval_s_cleaned.json -Provider deepseek -Model deepseek-flash -Limit 5
 .\eval\longmem\runlongmem.ps1 -DatasetPath .\eval\datasets\LongMemEval\longmemeval_s_cleaned.json -Provider deepseek -Model deepseek-flash -Limit 5 -Retrieval vsearch
+.\eval\longmem\runlongmem.ps1 -DatasetPath .\eval\datasets\LongMemEval\longmemeval_s_cleaned.json -Provider deepseek -Model deepseek-flash -Limit 5 -Retrieval query
 ```
 
-脚本默认取前 5 题、`memory` 模式、`search` 检索和 `deepseek/deepseek-flash`，自动创建 `eval/longmem/runs/<数据集名>--<编号>`。`-Retrieval vsearch` 需要 BatMem `.env` 中的 `JINA_API_KEY`。`-Types` 筛选题型，`-BuildsDirectory` 指定缓存，`-OutputDirectory` 指定新 run，`-Mode no-memory` 跳过摘要建库。`-JudgeProvider / -JudgeModel` 单独指定评分模型，`-TimeoutMs` 设置问答和 Judge 超时，默认 120000 毫秒。每段历史仅在首次建库时调用一次摘要模型。
+脚本默认取前 5 题、`memory` 模式、`search` 检索和 `deepseek/deepseek-flash`，自动创建 `eval/longmem/runs/<数据集名>--<编号>`。`-Retrieval vsearch` 或 `-Retrieval query` 需要 BatMem `.env` 中的 `JINA_API_KEY`。`-Types` 筛选题型，`-BuildsDirectory` 指定缓存，`-OutputDirectory` 指定新 run，`-Mode no-memory` 跳过摘要建库。`-JudgeProvider / -JudgeModel` 单独指定评分模型，`-TimeoutMs` 设置问答和 Judge 超时，默认 120000 毫秒。每段历史仅在首次建库时调用一次摘要模型。
 
 分阶段执行时，`prepare` 生成文件，其余阶段调用配置模型：
 

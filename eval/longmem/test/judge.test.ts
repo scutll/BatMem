@@ -3,8 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { createJudgePrompt, judgeAnswers, loadJudgePrompts, parseJudgeResponse, summarizeJudgments } from "../judge.ts";
 import type { MemorySample } from "../dataset.ts";
+import { createJudgePrompt, judgeAnswers, loadJudgePrompts, parseJudgeResponse, summarizeJudgments } from "../judge.ts";
 import { createEvaluationRun, prepareBuild } from "../runner.ts";
 
 const sample: MemorySample = {
@@ -29,52 +29,70 @@ it("uses official category prompts and rejects ambiguous verdicts", async () => 
 	assert.throws(() => parseJudgeResponse("not yes"), /Invalid/);
 });
 
-it("validates answer completeness before any Judge call and aggregates judgments", async () => {
-	const root = await mkdtemp(join(tmpdir(), "batmem-judge-"));
-	try {
-		const source = join(root, "source.json");
-		await writeFile(source, "fixture");
-		const run = join(root, "run");
-		const build = await prepareBuild(
-			{
-				sourcePath: source,
-				async *readSamples() {
-					yield sample;
+for (const retrieval of ["search", "query"] as const) {
+	it(`validates answer completeness and records ${retrieval} in Judge metrics`, async () => {
+		const root = await mkdtemp(join(tmpdir(), "batmem-judge-"));
+		try {
+			const source = join(root, "source.json");
+			await writeFile(source, "fixture");
+			const run = join(root, "run");
+			const build = await prepareBuild(
+				{
+					sourcePath: source,
+					async *readSamples() {
+						yield sample;
+					},
 				},
-			},
-			join(root, "builds"),
-			{ limit: 1, types: [] },
-			{ model: "mock/summary", summaryPromptSha256: "prompt-hash", syncMode: "session-final" },
-		);
-		await createEvaluationRun(run, build);
-		await writeFile(join(run, "answers-memory.jsonl"), "");
-		let calls = 0;
-		const generate = async () => {
-			calls++;
-			return { text: "yes", model: "mock-deepseek", usage: {} };
-		};
-		await assert.rejects(judgeAnswers(run, generate), /match all/);
-		assert.equal(calls, 0);
-		await writeFile(
-			join(run, "answers-memory.jsonl"),
-			`${JSON.stringify({ question_id: sample.id, hypothesis: "cat" })}\n`,
-		);
-		await judgeAnswers(run, generate);
-		assert.equal(calls, 1);
-		const metrics = JSON.parse(await readFile(join(run, "metrics-memory.json"), "utf8"));
-		assert.equal(metrics.overall_accuracy, 1);
-		assert.equal(metrics.retrieval, "search");
-		assert.deepEqual(metrics.judge_models, ["mock-deepseek"]);
-		const base = { question_id: "q", response: { text: "yes", model: "mock", usage: {} } };
-		const grouped = summarizeJudgments([
-			{ ...base, question_type: "multi-session", abstention: false, label: true },
-			{ ...base, question_type: "multi-session", abstention: false, label: false },
-			{ ...base, question_type: "knowledge-update", abstention: true, label: true },
-		]);
-		assert.equal(grouped.overall_accuracy, 2 / 3);
-		assert.equal(grouped.task_averaged_accuracy, 0.75);
-		assert.equal(grouped.abstention_accuracy, 1);
-	} finally {
-		await rm(root, { recursive: true, force: true });
-	}
-});
+				join(root, "builds"),
+				{ limit: 1, types: [] },
+				{ model: "mock/summary", summaryPromptSha256: "prompt-hash", syncMode: "session-final" },
+			);
+			await createEvaluationRun(
+				run,
+				build,
+				retrieval,
+				retrieval === "query"
+					? {
+							identity: "test/judge-query:v1",
+							dimensions: 2,
+							async embedDocuments() {
+								throw new Error("Judge must not embed documents");
+							},
+							async embedQuery() {
+								throw new Error("Judge must not embed queries");
+							},
+						}
+					: undefined,
+			);
+			await writeFile(join(run, "answers-memory.jsonl"), "");
+			let calls = 0;
+			const generate = async () => {
+				calls++;
+				return { text: "yes", model: "mock-deepseek", usage: {} };
+			};
+			await assert.rejects(judgeAnswers(run, generate), /match all/);
+			assert.equal(calls, 0);
+			await writeFile(
+				join(run, "answers-memory.jsonl"),
+				`${JSON.stringify({ question_id: sample.id, hypothesis: "cat" })}\n`,
+			);
+			await judgeAnswers(run, generate);
+			assert.equal(calls, 1);
+			const metrics = JSON.parse(await readFile(join(run, "metrics-memory.json"), "utf8"));
+			assert.equal(metrics.overall_accuracy, 1);
+			assert.equal(metrics.retrieval, retrieval);
+			assert.deepEqual(metrics.judge_models, ["mock-deepseek"]);
+			const base = { question_id: "q", response: { text: "yes", model: "mock", usage: {} } };
+			const grouped = summarizeJudgments([
+				{ ...base, question_type: "multi-session", abstention: false, label: true },
+				{ ...base, question_type: "multi-session", abstention: false, label: false },
+				{ ...base, question_type: "knowledge-update", abstention: true, label: true },
+			]);
+			assert.equal(grouped.overall_accuracy, 2 / 3);
+			assert.equal(grouped.task_averaged_accuracy, 0.75);
+			assert.equal(grouped.abstention_accuracy, 1);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+}

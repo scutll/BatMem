@@ -5,9 +5,10 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { openDatabase } from "../src/storage/db.ts";
 import type { EmbeddingProvider } from "../src/embedding/provider.ts";
 import { MemoryService } from "../src/memory/service.ts";
+import { openDatabase } from "../src/storage/db.ts";
+import { mockReranking } from "./helpers/reranking.ts";
 
 // Construct session-shaped inputs; no session files or real model requests are needed.
 function createUserMessage(id: string, parentId: string | null, text: string, second = 0): SessionEntry {
@@ -69,12 +70,14 @@ describe("cross-session memory", () => {
 	let memory: MemoryService;
 
 	beforeEach(async () => {
+		mockReranking(mock);
 		directory = await mkdtemp(join(tmpdir(), "batmem-memory-"));
 		db = openDatabase(join(directory, "nested", "index.db"));
 		memory = new MemoryService(db);
 	});
 
 	afterEach(async () => {
+		mock.restoreAll();
 		db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
@@ -194,7 +197,45 @@ describe("cross-session memory", () => {
 		memory = new MemoryService(db, embedding);
 		await memory.ready;
 		assert.deepEqual(encoded, ["existing summary"]);
-		assert.equal((await memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"))[0].text, "existing summary");
+		assert.equal(
+			(await memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"))[0].text,
+			"existing summary",
+		);
+	});
+
+	it("query waits for startup backfill and returns the vector summary with its current cursor", async () => {
+		await memory.syncSession(
+			createSessionSnapshot([createUserMessage("u1", null, "event")]),
+			async () => "stored summary",
+		);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<number[][]>();
+		let queryCalls = 0;
+		const provider: EmbeddingProvider = {
+			identity: "test/query-startup:v1",
+			dimensions: 2,
+			async embedDocuments() {
+				started.resolve();
+				return release.promise;
+			},
+			async embedQuery() {
+				queryCalls++;
+				return [1, 0];
+			},
+		};
+		memory = new MemoryService(db, provider);
+		const pending = memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, "query");
+		await started.promise;
+		assert.equal(queryCalls, 0);
+		release.resolve([[1, 0]]);
+		const hits = await pending;
+		assert.equal(hits[0].sourceId, "session-a");
+		assert.equal(hits[0].location.entryId, "u1");
+		const vectorHits = await memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, "vsearch");
+		assert.deepEqual(hits, [{ ...vectorHits[0], score: 0.75 }]);
+		db.prepare("UPDATE summaries SET content = 'changed'").run();
+		await assert.rejects(memory.searchSummaries({ query: "changed", topK: 1 }, "query"), /incomplete/);
+		assert.equal(queryCalls, 2);
 	});
 
 	it("reads the newest three matching user/assistant messages in a session", async () => {

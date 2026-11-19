@@ -14,7 +14,7 @@ BatMem 采用两层评测：**RAG Retrieval Eval** 检查共享检索模块的�
 | --- | --- |
 | `MemoryService` | `sessions` 保存会话来源，`messages` 保存消息文本，`summaries` 为每个会话保存一条当前摘要及处理位置 |
 | `RAGService` | 扫描 Markdown，以内容哈希判断变更，将文档和切块保存到 `documents / chunks` |
-| `SearchService` | 统一执行 `retrieve(request, options)`，按 Options 创建 Recall 和 Processor |
+| `Retriever` | 统一执行 `retrieve(request, options)`，按 Options 创建 Recall 和 Processor |
 | `VectorIndex` | 分批生成缺失向量，写入 `embeddings`；`embedding_config` 保存数据库当前使用的编码配置 |
 | `openDatabase()` | 初始化表、FTS5 全文索引及触发器；启用外键、WAL 和 5 秒锁等待 |
 
@@ -24,7 +24,7 @@ BatMem 采用两层评测：**RAG Retrieval Eval** 检查共享检索模块的�
 
 ```text
 session_start
-  → openDatabase() → MemoryService / RAGService / SearchService
+  → openDatabase() → MemoryService / RAGService / Retriever
   → 配置了 embedding 时，补建已有摘要的向量
   → scanDocuments() → indexDocument() → chunkMarkdown() → replaceDocumentIndex()
   → 配置了 embedding 时，补建文档块向量
@@ -62,7 +62,7 @@ session_shutdown
 ```text
 Extension / Eval 选择 RetrievalOptions
   → MemoryService / 文档工具传递 Options
-  → SearchService.retrieve(request, options)
+  → Retriever.retrieve(request, options)
   → createRecall(deps) / createProcessor(deps)
   → RecallResult[] → Processor → RetrievalHit[]
 ```
@@ -77,7 +77,7 @@ Extension / Eval 选择 RetrievalOptions
 
 ### 评测方式简述
 
-针对固定语料和查询，调用生产 `SearchService`，将前 K 项结果与相关性标注 Qrels 比较。该评测覆盖入库、检索和排序，评分阶段使用文档 ID。
+针对固定语料和查询，调用生产 `Retriever`，将前 K 项结果与相关性标注 Qrels 比较。该评测覆盖入库、检索和排序，评分阶段使用文档 ID。
 
 ```text
 BEIR → DatasetLoader → 构建或复用索引 → search / vsearch / query
@@ -86,7 +86,7 @@ BEIR → DatasetLoader → 构建或复用索引 → search / vsearch / query
 
 ### 检索方式选择
 
-CLI 的 `--mode` 和 PowerShell 的 `-Mode` 在入口选择 `strategies.ts` 中的 Options，默认 `search`。程序调用 `runRetrievalEval()` 时直接传入 `retrieval: selectedOptions`，以及借用的 embedding、reranking provider。是否补建向量由 Options 的 `requiresEmbedding` 决定。运行清单从 ID 和 metadata 记录检索方式、召回路径、Processor 与分数含义，相关源码纳入审计哈希；策略变化不改变语料 build 指纹。
+CLI 的 `--mode` 和 PowerShell 的 `-Mode` 在入口选择 `registry.ts` 中的 Options，默认 `search`。程序调用 `runRetrievalEval()` 时直接传入 `retrieval: selectedOptions`，以及借用的 embedding、reranking provider。是否补建向量由 Options 的 `requiresEmbedding` 决定。运行清单从 ID 和 metadata 记录检索方式、召回路径、Processor 与分数含义，相关源码纳入审计哈希；策略变化不改变语料 build 指纹。
 
 ### 当前构建缓存与恢复
 
@@ -113,7 +113,7 @@ eval/rag/runs/<run-id>/
 
 ### 评测数据集来源
 
-当前适配器为 [`BeirDataset`](../eval/rag/beir.ts)，读取本地 [BEIR](https://github.com/beir-cellar/beir) 目录中的 `corpus.jsonl`、`queries.jsonl` 和 `qrels/<split>.tsv`。
+当前适配器为 [`BeirDataset`](../eval/rag/datasets/beir.ts)，读取本地 [BEIR](https://github.com/beir-cellar/beir) 目录中的 `corpus.jsonl`、`queries.jsonl` 和 `qrels/<split>.tsv`。
 
 每条 corpus 记录保留 `_id`，非空标题和正文以换行连接，整条记录作为一个文档块。查询集保留所选 Qrels 划分中有标注的查询，并校验标注指向的语料 ID。
 
@@ -133,7 +133,7 @@ eval/rag/runs/<run-id>/
 
 ### 评测框架提供的接口
 
-[`score_rag.py`](../eval/rag/score_rag.py) 使用固定版本 `ragas==0.4.4` 的 `SingleTurnSample`、`IDBasedContextPrecision` 和 `IDBasedContextRecall`；CP、MRR 和 nDCG 在脚本中计算。评分读取已导出的排名和 Qrels，同一份导出可重复评分，无需模型请求。
+[`score_rag.py`](../eval/rag/scoring/score_rag.py) 使用固定版本 `ragas==0.4.4` 的 `SingleTurnSample`、`IDBasedContextPrecision` 和 `IDBasedContextRecall`；CP、MRR 和 nDCG 在脚本中计算。评分读取已导出的排名和 Qrels，同一份导出可重复评分，无需模型请求。
 
 ### Extension 与评测接口
 
@@ -142,7 +142,7 @@ eval/rag/runs/<run-id>/
 | `dataset.ts / DatasetLoader` | `readCorpus()` 提供 `{ id, text }` 异步流，`loadQueries()` 提供 `{ id, text, qrels }` |
 | `build.ts / indexCorpus()` | 将每条记录包装为完整块，调用 `RAGService.replaceDocumentIndex()` |
 | `build.ts / fingerprintCorpus()`、`prepareCorpusBuild()` | 确定语料身份，构建或打开共享索引 |
-| `runner.ts / runRetrievalEval()` | 加载查询 → 准备 build → 校验 Qrels → 按需补建向量 → 组装 `SearchService` |
+| `runner.ts / runRetrievalEval()` | 加载查询 → 准备 build → 校验 Qrels → 按需补建向量 → 组装 `Retriever` |
 | `runner.ts / exportResults()` | 顺序调用选定搜索函数，按原排名导出每条查询，保留空结果 |
 | `run.ts` | 解析 CLI，组装 `BeirDataset`、embedding 配置和 Runner |
 
@@ -161,7 +161,7 @@ prepare → build → answer → judge
 
 ### 评测数据集来源
 
-[`LongMemEvalDataset`](../eval/longmem/longmemeval.ts) 读取 [LongMemEval](https://github.com/xiaowu0162/LongMemEval) JSON 数组，将一条样本转换为问题、日期、类型、历史列表和参考答案。
+[`LongMemEvalDataset`](../eval/longmem/datasets/longmemeval.ts) 读取 [LongMemEval](https://github.com/xiaowu0162/LongMemEval) JSON 数组，将一条样本转换为问题、日期、类型、历史列表和参考答案。
 
 | 数据字段 | 用途 |
 | --- | --- |
@@ -187,7 +187,7 @@ Judge 按题型套用本地保存的官方 Prompt，输入问题、参考答案�
 
 ### 评测框架提供的接口
 
-[`judge-prompts.json`](../eval/longmem/judge-prompts.json) 保存官方提交 `9e0b455f4ef0e2ab8f2e582289761153549043fc` 的 `get_anscheck_prompt()` 模板及来源哈希。`createJudgePrompt()` 选择模板，`judgeAnswers()` 经 Pi 模型运行时调用配置的评分模型，`summarizeJudgments()` 汇总二值判定。
+[`judge-prompts.json`](../eval/longmem/scoring/judge-prompts.json) 保存官方提交 `9e0b455f4ef0e2ab8f2e582289761153549043fc` 的 `get_anscheck_prompt()` 模板及来源哈希。`createJudgePrompt()` 选择模板，`judgeAnswers()` 经 Pi 模型运行时调用配置的评分模型，`summarizeJudgments()` 汇总二值判定。
 
 Judge 通过 `question_id` 对齐已保存回答与参考答案；评分前校验回答完整性和唯一性。Judge 使用问题、答案及回答文本，Trace 用于单独诊断。
 
@@ -262,7 +262,7 @@ eval/longmem/runs/<run-id>/
 
 ```powershell
 python -m venv eval/.venv
-.\eval\.venv\Scripts\python.exe -m pip install -r eval/rag/requirements.txt
+.\eval\.venv\Scripts\python.exe -m pip install -r eval/rag/scoring/requirements.txt
 ```
 
 一键检索与评分；向量模式需配置 BatMem `.env` 中的 `JINA_API_KEY`：
@@ -277,8 +277,8 @@ python -m venv eval/.venv
 
 ```powershell
 node eval/rag/run.ts --dataset eval/datasets/BEIR/scifact --mode search --output eval/rag/runs/scifact-001 --top-k 10 --split test
-.\eval\.venv\Scripts\python.exe eval/rag/score_rag.py eval/rag/runs/scifact-001 --k 1 5 10
-.\eval\.venv\Scripts\python.exe eval/rag/score_rag.py eval/rag/runs/scifact-001 --show-only
+.\eval\.venv\Scripts\python.exe eval/rag/scoring/score_rag.py eval/rag/runs/scifact-001 --k 1 5 10
+.\eval\.venv\Scripts\python.exe eval/rag/scoring/score_rag.py eval/rag/runs/scifact-001 --show-only
 ```
 
 `--k` 最大为检索导出的 Top-K，省略时仅计算该最大值。检索使用新输出目录，评分和报告查看可重复执行。

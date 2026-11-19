@@ -38,12 +38,12 @@ foreach ($relativePath in @('corpus.jsonl', 'queries.jsonl', "qrels/$Split.tsv")
 
 $pythonPath = Join-Path $PSScriptRoot '../.venv/Scripts/python.exe'
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-    throw 'Create eval/.venv with python -m venv, then install eval/rag/requirements.txt using its Python.'
+    throw 'Create eval/.venv with python -m venv, then install eval/rag/scoring/requirements.txt using its Python.'
 }
 $nodePath = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
 # Native command failures do not throw automatically in Windows PowerShell 5.1.
 & $pythonPath -c "from importlib.metadata import version; version('ragas')"
-if ($LASTEXITCODE -ne 0) { throw 'Install eval/rag/requirements.txt before running evaluation.' }
+if ($LASTEXITCODE -ne 0) { throw 'Install eval/rag/scoring/requirements.txt before running evaluation.' }
 
 $runsDirectory = Join-Path $PSScriptRoot 'runs'
 New-Item -ItemType Directory -Force -Path $runsDirectory | Out-Null
@@ -69,6 +69,6 @@ $cutoffs = @(1)
 Write-Host 'Stage: scoring retrieval results'
 if ($TopK -ge 5) { $cutoffs += 5 }
 if ($TopK -ne 1 -and $TopK -ne 5) { $cutoffs += $TopK }
-& $pythonPath (Join-Path $PSScriptRoot 'score_rag.py') $outputDirectory --k @cutoffs
+& $pythonPath (Join-Path $PSScriptRoot 'scoring/score_rag.py') $outputDirectory --k @cutoffs
 if ($LASTEXITCODE -ne 0) { throw "Scoring failed (exit $LASTEXITCODE); retrieval results: $outputDirectory" }
 Write-Host "Report: $(Join-Path $outputDirectory 'metrics.json')"

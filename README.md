@@ -91,24 +91,24 @@ CLI 默认把可复用索引保存在 `eval/rag/builds/<语料指纹>/index.db`�
 
 ## Options 与统一检索
 
-Extension、RAG Eval 和 LongMemEval 共用 `RetrievalOptions`。策略在 [strategies.ts](src/search/strategies.ts) 的 `DEFAULT_STRATEGIES` 注册，上层按名称选择并传入服务：
+Extension、RAG Eval 和 LongMemEval 共用 `RetrievalOptions`。策略在 [registry.ts](src/retrieval/strategies/registry.ts) 的 `DEFAULT_STRATEGIES` 注册，上层按名称选择并传入 Retriever：
 
 ```text
 策略名称 → RetrievalOptions → createRecall → 各路径 run()
                          → createProcessor → 汇总、排序 → 截取 topK
 ```
 
-`createRecall` 和 `createProcessor` 接收已绑定当前数据源的 `bm25`、可选的 `vector`、`reranker` 等依赖。服务每次检索创建 Recall 和 Processor，切换策略时复用数据库和 Provider。接口定义见 [types.ts](src/search/types.ts)、[recall.ts](src/search/recall.ts) 和 [processor.ts](src/search/processor.ts)。
+`createRecall` 和 `createProcessor` 接收已绑定当前数据源的 `bm25`、可选的 `vector`、`reranker` 等依赖。服务每次检索创建 Recall 和 Processor，切换策略时复用数据库和 Provider。接口定义见 [types.ts](src/retrieval/core/types.ts)、[recall.ts](src/retrieval/core/recall.ts) 和 [processor.ts](src/retrieval/core/processor.ts)。
 
 ### 自定义召回路径
 
-提示词、召回路径和 Options 可集中在一个策略文件。简单组合也可以直接写在 `strategies.ts` 中。下面是在 `src/search/expanded-bm25.ts` 中新增单路策略的完整示例：
+提示词、召回路径和 Options 可集中在一个策略文件。内置组合位于 `retrieval/strategies/presets.ts`，注册表位于同目录的 `registry.ts`。下面是在 `src/retrieval/strategies/expanded-bm25.ts` 中新增单路策略的完整示例：
 
 ```ts
-import { deepseekCompletion } from "../ai/deepseek-completion.ts";
-import { ParallelRecall } from "./parallel-recall.ts";
-import { PassthroughProcessor } from "./passthrough-processor.ts";
-import type { RetrievalOptions } from "./types.ts";
+import { deepseekCompletion } from "../../models/completion/deepseek.ts";
+import { ParallelRecall } from "../recall/parallel.ts";
+import { PassthroughProcessor } from "../processors/passthrough.ts";
+import type { RetrievalOptions } from "../core/types.ts";
 
 const EXPAND_PROMPT =
     "将输入改写为文档检索查询，保留实体和限制条件，补充少量相关术语。只输出查询文本。";
@@ -151,11 +151,11 @@ AI 实例在首次执行扩写时创建，后续调用复用；注册策略本�
 DEEPSEEK_API_KEY=your-deepseek-api-key
 ```
 
-模型、端点和超时可在 `new deepseekCompletion({ ... })` 中设置，配置类型见 [ai/types.ts](src/ai/types.ts)。扩写模型独立于 Pi 的对话模型配置；当前默认模型为 `deepseek-flash`。
+模型、端点和超时可在 `new deepseekCompletion({ ... })` 中设置，配置类型见 [completion/types.ts](src/models/completion/types.ts)。扩写模型独立于 Pi 的对话模型配置；当前默认模型为 `deepseek-flash`。
 
 ### 多路召回与自定义 Processor
 
-已有的 [multiBm25Recall.ts](src/search/multiBm25Recall.ts) 将提示词、延迟创建的 AI 实例、四条路径和 RRF 后处理集中在 `createMultiBM25Options()` 中：
+已有的 [multi-bm25.ts](src/retrieval/strategies/multi-bm25.ts) 将提示词、延迟创建的 AI 实例、四条路径和 RRF 后处理集中在 `createMultiBM25Options()` 中：
 
 | 路径 | 查询来源 |
 | --- | --- |
@@ -183,22 +183,26 @@ process(
 
 ### 注册到公共策略表
 
-在 `strategies.ts` 导入策略工厂并加入 `DEFAULT_STRATEGIES`。当前 `multi_bm25` 已注册；按上述示例新增 `expanded_bm25` 时，注册表写为：
+在 `retrieval/strategies/registry.ts` 导入策略工厂并加入 `DEFAULT_STRATEGIES`。当前 `multi_bm25` 和 `weighted_mbe` 已注册；按上述示例新增 `expanded_bm25` 时，注册表写为：
 
 ```ts
 import { createExpandedBM25Options } from "./expanded-bm25.ts";
-import { createMultiBM25Options } from "./multiBm25Recall.ts";
+import { createMultiBM25Options } from "./multi-bm25.ts";
+import { createMultiBM25EmbeddingOptions } from "./multi-bm25-embedding.ts";
+import { BM25_RECALL, EMBEDDING_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS } from "./presets.ts";
+import type { RetrievalOptions } from "../core/types.ts";
 
 export const DEFAULT_STRATEGIES: Readonly<Record<string, RetrievalOptions>> = {
     search: BM25_RECALL,
     vsearch: EMBEDDING_RECALL,
     query: BM25_EMBEDDING_RRF_RERANK_OPTIONS,
     multi_bm25: createMultiBM25Options(),
+    weighted_mbe: createMultiBM25EmbeddingOptions(),
     expanded_bm25: createExpandedBM25Options(),
 };
 ```
 
-注册表的键用于命令、工具和 CLI 选择，`id` 用于记录和恢复评测策略，应保持一致。`metadata` 描述实际路径、处理方式和分数含义，不参与执行。新增公共策略后，Extension 与两套 Eval CLI 都能识别；`modes.ts` 从注册表自动生成可选名称，两个 PowerShell 包装脚本也接受自定义检索名称。
+注册表的键用于命令、工具和 CLI 选择，`id` 用于记录和恢复评测策略，应保持一致。`metadata` 描述实际路径、处理方式和分数含义，不参与执行。新增公共策略后，Extension 与两套 Eval CLI 都能识别；`registry.ts` 从注册表自动生成可选名称并提供名称校验，两个 PowerShell 包装脚本也接受自定义检索名称。
 
 ### 接入 Extension
 
@@ -259,87 +263,88 @@ LongMemEval 的 Provider 和模型需已在 Pi 配置中可用，用于摘要、
 
 ## Project Structure
 
-接口和实现分文件维护：`search/recall.ts` 定义召回接口，`parallel-recall.ts` 实现并发调度，`bm25-embedding-recall.ts` 定义双路组合；`processor.ts` 只定义接口，`embedding-query-processor.ts` 实现融合与重排，`passthrough-processor.ts` 实现单路透传。搜索数据契约与组合接口在 `search/types.ts`，运行时模式校验在 `search/modes.ts`。Embedding、扩展选项与两套 Eval 的配置和结果接口分别放在对应的 `types.ts`，调用方直接从类型文件导入。
+运行时代码按功能模块组织，复杂的检索模块再按执行职责划分。接口与实现分别维护：
+
+- `retrieval/core/`：`Retriever` 执行完整检索，`QueryRetriever` 描述统一入口，`QueryRecall` 和 `QueryProcessor` 描述两个阶段。
+- `retrieval/recall/`：路径调度与组合，`utils/` 中的 BM25 和向量实现遵循单路 `RecallSource` 接口。
+- `retrieval/strategies/`：内置组合、策略提示词与注册表；`processors/` 保存可复用的后处理实现。
+- `models/`：文本生成、embedding 和 reranking；`storage/` 保存 SQLite、向量索引和结果映射。
+
+`src/index.ts` 保留为扩展加载入口，具体注册逻辑位于 `extension/register.ts`。Eval 的 Node 与 PowerShell 入口保留原路径；数据集、工作流、运行会话和评分实现分别归组。文档目录保持原位置。
 
 ```text
 BatMem/
-├── docs/                             # Design and evaluation guides
-│   ├── Eval.md                       # Evaluation workflow
-│   ├── Memories.md                   # Memory architecture
-│   ├── Notes-LongMemEval.md          # Dataset research notes
-│   ├── message-session-lifecycle.zh-CN.md
-│   └── test.md                       # Test plan
-├── eval/                             # Offline evaluation tools
-│   ├── longmem/                      # Cross-session answer evaluation
-│   │   ├── test/                     # Offline evaluation tests
-│   │   ├── dataset.ts                # Dataset contract
-│   │   ├── types.ts                  # Build, session, run and judge contracts
-│   │   ├── judge-prompts.json        # Official judge templates
-│   │   ├── judge.ts                  # Answer scoring
-│   │   ├── longmemeval.ts            # LongMemEval adapter
-│   │   ├── pi.ts                     # Pi SDK answer sessions
-│   │   ├── runner.ts                 # Build and run lifecycle
-│   │   ├── run.ts                    # Stage CLI
-│   │   ├── runlongmem.ps1            # Windows workflow
-│   │   └── sessions.ts               # History-to-Session conversion
-│   └── rag/                          # Retrieval evaluation
-│       ├── test/                     # Offline evaluation tests
-│       ├── beir.ts                   # BEIR dataset adapter
-│       ├── build.ts                  # Reusable corpus index
-│       ├── dataset.ts                # Dataset contract
-│       ├── types.ts                  # Build and retrieval evaluation contracts
-│       ├── progress.ts               # CLI progress display
-│       ├── run.ts                    # Retrieval CLI
-│       ├── runbeir.ps1               # Windows workflow
-│       ├── runner.ts                 # Retrieval and result export
-│       ├── score_rag.py              # Ragas and ranking metrics
-│       └── requirements.txt          # Python dependencies
-├── src/                              # Pi extension implementation
-│   ├── embedding/                    # Text encoding and vector storage
-│   │   ├── jina.ts                   # Jina HTTP provider
-│   │   ├── provider.ts               # Provider contract
-│   │   ├── types.ts                  # Provider options and vector index records
-│   │   └── vector-index.ts           # SQLite vector index
-│   ├── memory/                       # Session memory
-│   │   ├── service.ts                # Session sync and recall
-│   │   ├── summary.ts                # Summary model adapter
-│   │   └── types.ts                  # Session data contracts
-│   ├── rag/                          # Markdown document indexing
-│   │   ├── chunker.ts                # Source-aware chunking
-│   │   ├── service.ts                # Document scan and index
-│   │   └── types.ts                  # Document data contracts
-│   ├── search/                       # Shared retrieval strategies
-│   │   ├── bm25.ts                   # FTS5 keyword retrieval
-│   │   ├── rows.ts                   # SQL result mapping
-│   │   ├── recall.ts                 # Recall contract
-│   │   ├── bm25-embedding-recall.ts   # Default recall implementation
-│   │   ├── parallel-recall.ts         # Concurrent task execution
-│   │   ├── passthrough-processor.ts   # Single-path passthrough
-│   │   ├── strategies.ts              # Built-in retrieval Options
-│   │   ├── create-service.ts          # Source-bound service composition
-│   │   ├── processor.ts              # Processor contract
-│   │   ├── embedding-query-processor.ts # RRF fusion, reranking and score blending
-│   │   ├── modes.ts                  # Runtime mode validation
-│   │   ├── service.ts                # Unified retrieval service
-│   │   ├── types.ts                  # Retrieval contracts
-│   │   └── vector.ts                 # Vector query retrieval
+├── src/
+│   ├── index.ts                         # Pi 扩展入口
+│   ├── extension/
+│   │   ├── register.ts                  # 生命周期、工具与命令
+│   │   └── types.ts
+│   ├── memory/
+│   │   ├── service.ts                   # 会话同步与记忆访问
+│   │   ├── summary.ts                   # 摘要生成
+│   │   └── types.ts
+│   ├── documents/
+│   │   ├── service.ts                   # 文档扫描与入库
+│   │   ├── chunker.ts
+│   │   └── types.ts
+│   ├── retrieval/
+│   │   ├── core/
+│   │   │   ├── retriever.ts             # Recall → Processor
+│   │   │   ├── types.ts
+│   │   │   ├── recall.ts                # QueryRecall 接口
+│   │   │   └── processor.ts             # QueryProcessor 接口
+│   │   ├── recall/
+│   │   │   ├── parallel.ts
+│   │   │   ├── bm25-embedding.ts
+│   │   │   └── utils/
+│   │   │       ├── bm25.ts
+│   │   │       └── vector.ts
+│   │   ├── processors/
+│   │   │   ├── passthrough.ts
+│   │   │   └── rrf-rerank-blend.ts
+│   │   ├── strategies/
+│   │   │   ├── registry.ts             # 注册、选择与名称校验
+│   │   │   ├── presets.ts              # BM25、Vector、Hybrid
+│   │   │   ├── multi-bm25.ts
+│   │   │   └── multi-bm25-embedding.ts
+│   │   └── create-retriever.ts          # 数据源与依赖装配
+│   ├── models/
+│   │   ├── completion/                 # completion.ts、deepseek.ts、types.ts
+│   │   ├── embedding/                  # provider.ts、jina.ts、types.ts
+│   │   ├── reranking/                  # provider.ts、jina.ts、types.ts
+│   │   └── create-providers.ts          # Jina 配置与实例创建
+│   └── storage/
+│       ├── database.ts
+│       ├── vector-index.ts
+│       ├── vector-types.ts
+│       └── retrieval-row.ts
+├── eval/
+│   ├── rag/
+│   │   ├── run.ts / runbeir.ps1         # 运行入口
+│   │   ├── datasets/                   # BEIR 适配与数据接口
+│   │   ├── workflow/                   # 建库、检索、导出与进度
+│   │   ├── scoring/                    # score_rag.py、requirements.txt
+│   │   └── test/
+│   └── longmem/
+│       ├── run.ts / runlongmem.ps1
+│       ├── datasets/                   # LongMemEval 适配、接口与许可证
+│       ├── workflow/                   # 准备、建库与运行流程
+│       ├── runtime/                    # Pi 会话与历史 Session 转换
+│       ├── scoring/                    # Judge 与官方提示词
+│       └── test/
+├── test/
+│   ├── extension/
+│   ├── memory/
+│   ├── documents/
+│   ├── retrieval/
+│   │   ├── core/                       # 检索集成、调度与后处理
+│   │   └── strategies/                 # Options 装配与选择
+│   ├── models/
 │   ├── storage/
-│   │   └── db.ts                     # SQLite schema and connection
-│   ├── config.ts                     # Embedding configuration
-│   ├── types.ts                      # Extension composition options
-│   └── index.ts                      # Extension entry point
-├── test/                             # Core offline tests
-│   ├── CONTRACT.md                   # Test contract
-│   ├── chunker.test.ts
-│   ├── embedding.test.ts
-│   ├── memory.test.ts
-│   ├── rag.test.ts
-│   ├── search.test.ts
-│   ├── query.test.ts
-│   ├── extension.test.ts
-│   └── vector.test.ts
-├── .env.example                      # Embedding settings template
-├── .gitignore
+│   ├── helpers/
+│   └── CONTRACT.md
+├── docs/                               # 文档与历史版本，位置不变
+├── .env.example
 ├── package.json
 ├── package-lock.json
 └── tsconfig.json

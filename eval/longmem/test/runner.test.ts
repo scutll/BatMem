@@ -3,12 +3,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
-import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
-import { VectorIndex } from "../../../src/embedding/vector-index.ts";
+import type { EmbeddingProvider } from "../../../src/models/embedding/provider.ts";
+import { VectorIndex } from "../../../src/storage/vector-index.ts";
 import { MemoryService } from "../../../src/memory/service.ts";
-import { BM25_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS, EMBEDDING_RECALL } from "../../../src/search/strategies.ts";
-import { openDatabase } from "../../../src/storage/db.ts";
-import { LongMemEvalDataset, parseSample } from "../longmemeval.ts";
+import { BM25_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS, EMBEDDING_RECALL } from "../../../src/retrieval/strategies/presets.ts";
+import { openDatabase } from "../../../src/storage/database.ts";
+import { LongMemEvalDataset, parseSample } from "../datasets/longmemeval.ts";
 import {
 	buildMemory,
 	buildMemoryVectors,
@@ -19,8 +19,8 @@ import {
 	prepareSample,
 	reconcileMemoryBuild,
 	runMemoryEval,
-} from "../runner.ts";
-import type { MemoryBuildConfig, PreparedBuild } from "../types.ts";
+} from "../workflow/runner.ts";
+import type { MemoryBuildConfig, PreparedBuild } from "../workflow/types.ts";
 
 let root: string;
 let input: string;
@@ -290,9 +290,9 @@ it("query reuses summaries and vectors and rejects incomplete indexes before ans
 	const manifest = await createEvaluationRun(queryRun, build, BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding);
 	assert.equal(manifest.buildFingerprint, build.manifest.fingerprint);
 	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "rrf-rerank-blend" });
-	assert.ok(manifest.codeSha256?.["../../src/search/recall.ts"]);
-	assert.ok(manifest.codeSha256["../../src/search/bm25-embedding-recall.ts"]);
-	assert.ok(manifest.codeSha256["../../src/search/embedding-query-processor.ts"]);
+	assert.ok(manifest.codeSha256?.["../../../src/retrieval/core/recall.ts"]);
+	assert.ok(manifest.codeSha256["../../../src/retrieval/recall/bm25-embedding.ts"]);
+	assert.ok(manifest.codeSha256["../../../src/retrieval/processors/rrf-rerank-blend.ts"]);
 	const sourcePath = join(prepared.project, ".pi", "docs-memory", "index.db");
 	const before = await readFile(sourcePath);
 	await runMemoryEval(queryRun, build, answer, "memory", BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding);

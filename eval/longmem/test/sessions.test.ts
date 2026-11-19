@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { createSessionEntries, loadSessionSnapshot, parseHistoryDate, writeHistorySessions } from "../sessions.ts";
+import { createSessionEntries, loadSessionSnapshot, parseHistoryDate, writeHistorySessions } from "../runtime/history-sessions.ts";
 
 it("round-trips complete Pi sessions with original roles, text, timestamps and a linear parent chain", async () => {
 	const root = await mkdtemp(join(tmpdir(), "batmem-session-"));

@@ -7,12 +7,12 @@ sqlite-vec 查询；摘要与 embedding 响应使用固定 Mock，不读取真�
 从 BatMem 根目录运行：
 
 ```powershell
-node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts test/query.test.ts test/extension.test.ts
+node --test test/memory/memory.test.ts test/documents/documents.test.ts test/documents/chunker.test.ts test/models/embedding.test.ts test/storage/vector-index.test.ts test/retrieval/core/retriever.test.ts test/retrieval/core/query.test.ts test/extension/extension.test.ts
 ```
 
 ## 公共接口
 
-类型从对应契约文件导入：搜索为 `src/search/types.ts` 和 `src/search/processor.ts`，Embedding 配置及索引记录为 `src/embedding/types.ts`，扩展选项为 `src/types.ts`，Eval 运行接口为各自目录下的 `types.ts`。`QueryRecall` 接口位于 `recall.ts`，并发调度由 `parallel-recall.ts` 实现，具体组合位于 `bm25-embedding-recall.ts`；Processor 具体实现位于 `embedding-query-processor.ts`。实现文件不再兼容转导出已迁移的接口。
+类型从对应契约文件导入：搜索为 `src/retrieval/core/types.ts` 和 `src/retrieval/core/processor.ts`，Embedding 配置为 `src/models/embedding/types.ts`，向量索引记录为 `src/storage/vector-types.ts`，扩展选项为 `src/extension/types.ts`，Eval 运行接口为各自目录下的 `extension/types.ts`。`QueryRecall` 接口位于 `recall.ts`，并发调度由 `parallel.ts` 实现，具体组合位于 `bm25-embedding.ts`；Processor 具体实现位于 `rrf-rerank-blend.ts`。实现文件不再兼容转导出已迁移的接口。
 
 - `openDatabase(path)` 创建父目录并初始化文本、FTS5 和向量元数据表，返回由调用方关闭的
   `node:sqlite` 连接。
@@ -36,7 +36,7 @@ node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embed
 - `VectorIndex.getStatus(source)` 返回 `{ total, indexed, pending }`。`search(source, vector, topK)`
   仅在配置匹配且该来源完整时执行真实 sqlite-vec 余弦查询，返回分数降序结果。
 - `VectorRetriever` 在 query 编码前检查索引状态，编码后再次检查，再执行来源限定的向量查询。
-- `SearchService.retrieve(request, options)` 统一执行 Options 的 Recall 与 Processor 工厂，每次调用创建执行对象并按最终 topK 截取。BM25 与向量使用单路透传，混合策略使用双路融合重排。切换不重建服务或 Provider。
+- `Retriever.retrieve(request, options)` 统一执行 Options 的 Recall 与 Processor 工厂，每次调用创建执行对象并按最终 topK 截取。BM25 与向量使用单路透传，混合策略使用双路融合重排。切换不重建服务或 Provider。
 - `ParallelRecall(tasks)` 接收 `{ path, run }[]`；路径可改写查询、处理结果，各路请求独立，全部结束后按声明顺序汇总。失败时排空任务并抛出错误。
 - `QueryProcessor.process(request, results)` 接收原始请求与全部成功路径。
   `EmbeddingQueryProcessor` 每路先按来源身份去重、保留首次命中，再以去重后的排名计算
@@ -62,4 +62,4 @@ RAG 测试会先把 `testDocs` 复制到临时目录。目录不存在时使用 
 固定向量只验证请求、存储、失效、排名和来源映射，不证明真实 Jina 模型的语义召回质量。
 真实 BEIR 和 LongMemEval 由 eval 命令单独运行。
 
-Options 的请求隔离、run 内改写、单路透传约束和未知名称由 `test/retrieval-options.test.ts` 覆盖；Extension 测试验证命令切换、工具临时覆盖、自定义无向量策略与自动注入。
+Options 的请求隔离、run 内改写、单路透传约束和未知名称由 `test/retrieval/strategies/options.test.ts` 覆盖；Extension 测试验证命令切换、工具临时覆盖、自定义无向量策略与自动注入。

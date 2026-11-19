@@ -3,10 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
-import { selectRetrievalOptions } from "../../../src/search/strategies.ts";
-import type { MemorySample } from "../dataset.ts";
-import { createJudgePrompt, judgeAnswers, loadJudgePrompts, parseJudgeResponse, summarizeJudgments } from "../judge.ts";
-import { createEvaluationRun, prepareBuild } from "../runner.ts";
+import { selectRetrievalOptions } from "../../../src/retrieval/strategies/registry.ts";
+import type { MemorySample } from "../datasets/types.ts";
+import { createJudgePrompt, judgeAnswers, loadJudgePrompts, parseJudgeResponse, summarizeJudgments } from "../scoring/judge.ts";
+import { createEvaluationRun, prepareBuild } from "../workflow/runner.ts";
 
 const sample: MemorySample = {
 	id: "q1",

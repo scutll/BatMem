@@ -5,12 +5,12 @@
 BatMem 通过 Pi Extension 提供两类项目内记忆：Cross-session Memory 保存会话消息和摘要，Document RAG 将本地 Markdown 切块并索引。两者共用项目目录下的 `.pi/docs-memory/index.db`，分别以会话摘要和文档块作为检索单元，结果携带原始文件的定位信息。
 
 ```text
-src/index.ts：生命周期与工具入口
+src/index.ts → src/extension/register.ts：生命周期与工具入口
   ├─ SessionManager.getEntries()
   │    → MemoryService.syncSession() → 消息入库 → 增量摘要 → 摘要索引
   ├─ documents/*.md（递归）
   │    → RAGService.scanDocuments() → chunkMarkdown() → 文档块索引
-  └─ SearchService.retrieve(request, options)（限定来源）
+  └─ Retriever.retrieve(request, options)（限定来源）
        ├─ search  → BM25Retriever → SQLite FTS5
        ├─ vsearch → VectorRetriever → 查询编码 → VectorIndex → sqlite-vec
        └─ query   → 双路召回 → RRF 融合 → Jina 重排 → 混合评分
@@ -18,7 +18,7 @@ src/index.ts：生命周期与工具入口
 摘要 / 文档块 → VectorIndex.syncEmbeddings() → Jina 编码 → 向量存储
 ```
 
-`src/memory` 负责会话同步与摘要，`src/rag` 负责文档解析与索引，`src/search` 负责检索编排，`src/embedding` 和 `src/reranking` 对接模型服务，`src/storage/db.ts` 管理数据库结构。原始 Session JSONL 和 Markdown 文件保留为来源。
+`src/memory` 负责会话同步与摘要，`src/documents` 负责文档解析与索引，`src/retrieval` 负责检索编排，`src/models/embedding` 和 `src/models/reranking` 对接模型服务，`src/storage/database.ts` 管理数据库结构。原始 Session JSONL 和 Markdown 文件保留为来源。
 
 ## Cross-session Memory
 
@@ -81,7 +81,7 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 替换或删除通过触发器清理旧全文索引和向量。扫描失败时保留已提交的文件更新，并跳过删除清理；向量生成失败时，已保存文本和全文索引继续可用。
 
-`rag_search` 等待启动扫描结束，将 Options 传给 `RAGService.searchChunks(request, options)`，由注入的 `RetrievalService` 执行检索。结果包含文档块、分数、Document ID、路径、块序号、行号和章节。同一文档可命中多个块，Agent 使用宿主 `read` 工具按路径和行号读取更多上下文。
+`rag_search` 等待启动扫描结束，将 Options 传给 `RAGService.searchChunks(request, options)`，由注入的 `QueryRetriever` 执行检索。结果包含文档块、分数、Document ID、路径、块序号、行号和章节。同一文档可命中多个块，Agent 使用宿主 `read` 工具按路径和行号读取更多上下文。
 
 ## 存储与 Jina HTTP 服务
 
@@ -101,7 +101,7 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 ### Jina 配置与传输
 
-`src/config.ts` 为 embedding 和 reranker 读取 BatMem 根目录的 `.env`，文件值优先进程环境变量，包括空值。`JINA_API_KEY` 为空时工厂返回 `undefined`。代理依次取本地 `HTTPS_PROXY`、本地 `HTTP_PROXY`、进程 `HTTPS_PROXY`、进程 `HTTP_PROXY`；未配置代理时使用独立 undici 连接直连。
+`src/models/create-providers.ts` 为 embedding 和 reranker 读取 BatMem 根目录的 `.env`，文件值优先进程环境变量，包括空值。`JINA_API_KEY` 为空时工厂返回 `undefined`。代理依次取本地 `HTTPS_PROXY`、本地 `HTTP_PROXY`、进程 `HTTPS_PROXY`、进程 `HTTP_PROXY`；未配置代理时使用独立 undici 连接直连。
 
 两类请求每次尝试超时 10 秒，覆盖响应正文读取。网络错误、超时及 HTTP 408、429、5xx 最多重试三次，429 重试前等待 20 秒。其他 HTTP 错误、无效 JSON 和响应校验失败直接抛出。
 
@@ -123,7 +123,7 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 ### 公共接口与模式
 
-`RetrievalService` 定义统一的 `retrieve(request, options)`，`SearchService` 实现该接口，接收 `{ query, topK }` 和上层选择的 `RetrievalOptions`，异步返回 `RetrievalHit[]`。统一字段为 `text`、`score`、`sourceType`、`sourceId` 和 `location`；摘要携带消息游标与更新时间，文档块携带块序号、行号和章节。会话与文档分别检索，各模式均按高分优先。
+`QueryRetriever` 定义统一的 `retrieve(request, options)`，`Retriever` 实现该接口，接收 `{ query, topK }` 和上层选择的 `RetrievalOptions`，异步返回 `RetrievalHit[]`。统一字段为 `text`、`score`、`sourceType`、`sourceId` 和 `location`；摘要携带消息游标与更新时间，文档块携带块序号、行号和章节。会话与文档分别检索，各模式均按高分优先。
 
 | 模式 | 执行路径 | 分数 |
 | --- | --- | --- |
@@ -135,9 +135,9 @@ BM25 提取字母、数字、下划线组成的词项，逐项加引号，用 OR
 
 ### Options 装配与选择
 
-`src/search/strategies.ts` 声明内置 Options：`search` 使用单路 BM25，`vsearch` 使用单路向量，两者配置 `PassthroughProcessor`；`query` 使用双路召回和融合重排。`RetrievalOptions` 包含 ID、依赖需求、可选评测描述和两个工厂，接口位于 `search/types.ts`。
+`src/retrieval/strategies/presets.ts` 声明内置 Options，`registry.ts` 注册与选择策略：`search` 使用单路 BM25，`vsearch` 使用单路向量，两者配置 `PassthroughProcessor`；`query` 使用双路召回和融合重排。`RetrievalOptions` 包含 ID、依赖需求、可选评测描述和两个工厂，接口位于 `retrieval/core/types.ts`。
 
-Extension 在注册时合并内置策略与 `retrieval.strategies`，在 `session_start` 通过 `createSearchService()` 创建来源限定的服务。每次调用开始时按“工具 strategy 参数 → 当前策略 → 启动默认策略”选择 Options，传给服务；`/memory-strategy <名称>` 切换后续自动召回和工具检索，省略名称时查看当前选择。切换复用服务、索引和 Provider，进行中的调用继续使用原来的执行对象。
+Extension 在注册时合并内置策略与 `retrieval.strategies`，在 `session_start` 通过 `createRetriever()` 创建来源限定的服务。每次调用开始时按“工具 strategy 参数 → 当前策略 → 启动默认策略”选择 Options，传给服务；`/memory-strategy <名称>` 切换后续自动召回和工具检索，省略名称时查看当前选择。切换复用服务、索引和 Provider，进行中的调用继续使用原来的执行对象。
 
 RAG Eval 的 CLI 在 `eval/rag/run.ts` 选择 Options，LongMemEval 在 `eval/longmem/run.ts` 选择，再经评测会话入口传入 Extension。程序调用可传递自定义 Options。Eval 根据 `requiresEmbedding` 判断向量构建需求，从 ID 和 metadata 保存策略描述。
 
@@ -146,7 +146,7 @@ RAG Eval 的 CLI 在 `eval/rag/run.ts` 选择 Options，LongMemEval 在 `eval/lo
 默认 `query` 由 `BM25EmbeddingRecall` 和 `EmbeddingQueryProcessor` 组成：
 
 ```text
-SearchService.retrieve(request, HYBRID_OPTIONS)
+Retriever.retrieve(request, BM25_EMBEDDING_RRF_RERANK_OPTIONS)
   → BM25EmbeddingRecall.recall(request)
       ├─ bm25：BM25Retriever.retrieve(request副本)
       └─ embedding：VectorRetriever.retrieve(request副本)

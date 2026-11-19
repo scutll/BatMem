@@ -3,15 +3,15 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, it } from "node:test";
-import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
-import { ParallelRecall } from "../../../src/search/parallel-recall.ts";
-import { BM25_RECALL, EMBEDDING_RECALL } from "../../../src/search/strategies.ts";
-import type { RetrievalOptions } from "../../../src/search/types.ts";
-import { openDatabase } from "../../../src/storage/db.ts";
+import type { EmbeddingProvider } from "../../../src/models/embedding/provider.ts";
+import { ParallelRecall } from "../../../src/retrieval/recall/parallel.ts";
+import { BM25_RECALL, EMBEDDING_RECALL } from "../../../src/retrieval/strategies/presets.ts";
+import type { RetrievalOptions } from "../../../src/retrieval/core/types.ts";
+import { openDatabase } from "../../../src/storage/database.ts";
 import { OFFLINE_HYBRID_OPTIONS } from "../../../test/helpers/reranking.ts";
-import { BeirDataset, loadQueries } from "../beir.ts";
-import type { DatasetLoader } from "../dataset.ts";
-import { runRetrievalEval } from "../runner.ts";
+import { BeirDataset, loadQueries } from "../datasets/beir.ts";
+import type { DatasetLoader } from "../datasets/types.ts";
+import { runRetrievalEval } from "../workflow/runner.ts";
 
 let root: string;
 let dataset: string;
@@ -180,12 +180,12 @@ it("query reuses vector builds and exports fused rankings with explicit pipeline
 	assert.equal(manifest.retriever, "query");
 	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "rrf-rerank-blend" });
 	assert.match(manifest.score, /RRF rank.*rerank/);
-	assert.ok(Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/recall.ts")));
+	assert.ok(Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/retrieval/core/recall.ts")));
 	assert.ok(
-		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/bm25-embedding-recall.ts")),
+		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/retrieval/recall/bm25-embedding.ts")),
 	);
 	assert.ok(
-		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/search/embedding-query-processor.ts")),
+		Object.keys(manifest.implementation_sha256).some((name) => name.endsWith("/retrieval/processors/rrf-rerank-blend.ts")),
 	);
 
 	const recoveredRun = join(root, "recovered-query");

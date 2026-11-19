@@ -1,10 +1,10 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { EmbeddingProvider } from "../embedding/provider.ts";
-import type { RetrievalService } from "../search/types.ts";
+import type { EmbeddingProvider } from "../models/embedding/provider.ts";
+import type { QueryRetriever } from "../retrieval/core/types.ts";
 
 export interface MemoryServiceOptions {
 	embedding?: EmbeddingProvider;
-	search?: RetrievalService;
+	search?: QueryRetriever;
 	/** Evaluation reads existing vectors without startup writes. Default: true. */
 	backfill?: boolean;
 }

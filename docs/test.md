@@ -13,7 +13,7 @@
 
 ## Cross-Session Memory
 
-现有文件：`test/memory.test.ts`。
+现有文件：`test/memory/memory.test.ts`。
 
 | 测试项 | 数据与操作 | 校验内容 |
 |---|---|---|
@@ -40,7 +40,7 @@
 
 ## Markdown 切块
 
-现有文件：`test/chunker.test.ts`。精确边界使用确定性短文本。
+现有文件：`test/documents/chunker.test.ts`。精确边界使用确定性短文本。
 
 | 测试项 | 数据与操作 | 校验内容 |
 | --- | --- | --- |
@@ -51,7 +51,7 @@
 
 ## Document RAG
 
-现有文件：`test/rag.test.ts`。长文档从 `testDocs` 复制到临时目录后再修改，不改动原始资料。当前测试在目录缺失时使用 `docs/Memories.md` 副本，目录存在但为空则报错；替代资料测试不等于完成用户提供文档的验证。
+现有文件：`test/documents/documents.test.ts`。长文档从 `testDocs` 复制到临时目录后再修改，不改动原始资料。当前测试在目录缺失时使用 `docs/Memories.md` 副本，目录存在但为空则报错；替代资料测试不等于完成用户提供文档的验证。
 
 | 测试项 | 数据与操作 | 校验内容 |
 |---|---|---|
@@ -149,11 +149,11 @@
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `test/retrieval-options.test.ts` | Options 工厂按次创建、运行中切换、run 内扩写、原始请求隔离与单路透传约束 |
-| `test/query.test.ts` | 三路并发启动、等待全部结束、同步/异步失败后排空任务、请求与并发调用隔离、路径校验、Processor 透传和错误传播 |
-| `test/search.test.ts` | 统一 Options 入口验证 BM25、向量与混合检索，融合后保留来源坐标；保留不同 chunk 坐标，索引不完整时不编码查询 |
-| `test/memory.test.ts` | query 等待启动补建，摘要游标正确，正文变化后拒绝不完整向量 |
-| `test/extension.test.ts` | 普通 memory_search/rag_search 的 query 路径与无 provider 错误，调用方保留 provider 所有权 |
+| `test/retrieval/strategies/options.test.ts` | Options 工厂按次创建、运行中切换、run 内扩写、原始请求隔离与单路透传约束 |
+| `test/retrieval/core/query.test.ts` | 三路并发启动、等待全部结束、同步/异步失败后排空任务、请求与并发调用隔离、路径校验、Processor 透传和错误传播 |
+| `test/retrieval/core/retriever.test.ts` | 统一 Options 入口验证 BM25、向量与混合检索，融合后保留来源坐标；保留不同 chunk 坐标，索引不完整时不编码查询 |
+| `test/memory/memory.test.ts` | query 等待启动补建，摘要游标正确，正文变化后拒绝不完整向量 |
+| `test/extension/extension.test.ts` | 普通 memory_search/rag_search 的 query 路径与无 provider 错误，调用方保留 provider 所有权 |
 | `eval/rag/test/eval.test.ts` | search/vsearch/query 共享 build，query 与 vsearch 分别导出各自分数和排名，记录 pipeline 与源码哈希，失败不发布完成 manifest |
 | `eval/longmem/test/runner.test.ts` | query 复用摘要和向量，完整性检查在回答前执行，缓存与 run 副本隔离 |
 | `eval/longmem/test/pi.test.ts` | 真实 Pi SDK + faux 模型 + 固定向量，query 自动注入与工具搜索，工具传入其他 strategy 不改变固定评测策略 |
@@ -164,7 +164,7 @@
 现有测试命令如下，从 BatMem 目录执行；新增测试文件落地后同步补充。
 
 ```powershell
-node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts test/query.test.ts test/extension.test.ts
+node --test test/memory/memory.test.ts test/documents/documents.test.ts test/documents/chunker.test.ts test/models/embedding.test.ts test/storage/vector-index.test.ts test/retrieval/core/retriever.test.ts test/retrieval/core/query.test.ts test/extension/extension.test.ts
 node --test eval/rag/test/eval.test.ts
 .\eval\.venv\Scripts\python.exe -m unittest discover -s eval/rag/test -p test_score_rag.py
 node --test eval/longmem/test/*.test.ts

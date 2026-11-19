@@ -13,7 +13,7 @@
 	},
 	"scripts": {
 		"check": "tsc --noEmit -p tsconfig.json",
-		"test:unit": "node --test test/completion.test.ts test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embedding.test.ts test/vector.test.ts test/search.test.ts test/query.test.ts test/retrieval-options.test.ts test/extension.test.ts test/reranking.test.ts eval/rag/test/eval.test.ts eval/longmem/test/*.test.ts"
+		"test:unit": "node --test test/models/completion.test.ts test/memory/memory.test.ts test/documents/documents.test.ts test/documents/chunker.test.ts test/models/embedding.test.ts test/storage/vector-index.test.ts test/retrieval/core/retriever.test.ts test/retrieval/core/query.test.ts test/retrieval/strategies/options.test.ts test/extension/extension.test.ts test/models/reranking.test.ts eval/rag/test/eval.test.ts eval/longmem/test/*.test.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",

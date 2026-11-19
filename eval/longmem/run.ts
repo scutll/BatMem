@@ -3,16 +3,15 @@ import { appendFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { createEmbeddingProvider, createRerankingProvider } from "../../src/config.ts";
-import type { JinaEmbeddingProvider } from "../../src/embedding/jina.ts";
+import { createEmbeddingProvider, createRerankingProvider } from "../../src/models/create-providers.ts";
+import type { JinaEmbeddingProvider } from "../../src/models/embedding/jina.ts";
 import { generateSessionSummary, SUMMARY_SYSTEM_PROMPT } from "../../src/memory/summary.ts";
-import type { JinaRerankingProvider } from "../../src/reranking/jina.ts";
-import { isSearchMode } from "../../src/search/modes.ts";
-import { selectRetrievalOptions } from "../../src/search/strategies.ts";
-import type { RetrievalOptions } from "../../src/search/types.ts";
-import { judgeAnswers } from "./judge.ts";
-import { LONG_MEM_EVAL_QUESTION_TYPES, LongMemEvalDataset } from "./longmemeval.ts";
-import { closeEvaluationSession, createEvaluationSession, runQuestion } from "./pi.ts";
+import type { JinaRerankingProvider } from "../../src/models/reranking/jina.ts";
+import { isSearchMode, selectRetrievalOptions } from "../../src/retrieval/strategies/registry.ts";
+import type { RetrievalOptions } from "../../src/retrieval/core/types.ts";
+import { judgeAnswers } from "./scoring/judge.ts";
+import { LONG_MEM_EVAL_QUESTION_TYPES, LongMemEvalDataset } from "./datasets/longmemeval.ts";
+import { closeEvaluationSession, createEvaluationSession, runQuestion } from "./runtime/pi.ts";
 import {
 	buildMemory,
 	buildMemoryVectors,
@@ -24,8 +23,8 @@ import {
 	prepareMemoryBuild,
 	reconcileMemoryBuild,
 	runMemoryEval,
-} from "./runner.ts";
-import type { MemoryBuildConfig, PreparedBuild } from "./types.ts";
+} from "./workflow/runner.ts";
+import type { MemoryBuildConfig, PreparedBuild } from "./workflow/types.ts";
 
 /** CLI wiring only: build owns reusable data; each run directory owns answers and Judge results. */
 const { values } = parseArgs({

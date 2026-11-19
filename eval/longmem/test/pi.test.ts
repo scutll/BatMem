@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { it } from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
-import { VectorIndex } from "../../../src/embedding/vector-index.ts";
-import { BM25_RECALL } from "../../../src/search/strategies.ts";
-import { openDatabase } from "../../../src/storage/db.ts";
+import type { EmbeddingProvider } from "../../../src/models/embedding/provider.ts";
+import { VectorIndex } from "../../../src/storage/vector-index.ts";
+import { BM25_RECALL } from "../../../src/retrieval/strategies/presets.ts";
+import { openDatabase } from "../../../src/storage/database.ts";
 import { OFFLINE_HYBRID_OPTIONS } from "../../../test/helpers/reranking.ts";
-import { closeEvaluationSession, createEvaluationSession, runQuestion } from "../pi.ts";
-import type { TraceEvent } from "../types.ts";
+import { closeEvaluationSession, createEvaluationSession, runQuestion } from "../runtime/pi.ts";
+import type { TraceEvent } from "../workflow/types.ts";
 
 for (const retrieval of ["search", "query", "custom-lexical"] as const) {
 	it(`runs the real Pi SDK with fixed ${retrieval} retrieval and only memory tools`, async () => {

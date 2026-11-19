@@ -1,8 +1,8 @@
-import { RerankingProvider } from "../../src/reranking/provider.ts";
-import type { RerankResult } from "../../src/reranking/types.ts";
-import { EmbeddingQueryProcessor } from "../../src/search/embedding-query-processor.ts";
-import { BM25_EMBEDDING_RRF_RERANK_OPTIONS } from "../../src/search/strategies.ts";
-import type { RetrievalHit, RetrievalOptions } from "../../src/search/types.ts";
+import { RerankingProvider } from "../../src/models/reranking/provider.ts";
+import type { RerankResult } from "../../src/models/reranking/types.ts";
+import { EmbeddingQueryProcessor } from "../../src/retrieval/processors/rrf-rerank-blend.ts";
+import { BM25_EMBEDDING_RRF_RERANK_OPTIONS } from "../../src/retrieval/strategies/presets.ts";
+import type { RetrievalHit, RetrievalOptions } from "../../src/retrieval/core/types.ts";
 
 /** Offline scores returned in reverse input order to expose accidental use of response position as rank. */
 export class OfflineReranker extends RerankingProvider {

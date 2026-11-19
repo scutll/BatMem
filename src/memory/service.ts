@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
-import { VectorIndex } from "../embedding/vector-index.ts";
-import { createSearchService } from "../search/create-service.ts";
-import type { RetrievalHit, RetrievalOptions, RetrievalQuery, RetrievalService } from "../search/types.ts";
+import { VectorIndex } from "../storage/vector-index.ts";
+import { createRetriever } from "../retrieval/create-retriever.ts";
+import type { RetrievalHit, RetrievalOptions, RetrievalQuery, QueryRetriever } from "../retrieval/core/types.ts";
 import type {
 	IndexedMessage,
 	MemoryServiceOptions,
@@ -14,14 +14,14 @@ import type {
 export class MemoryService {
 	private readonly db: DatabaseSync;
 	private readonly vectors?: VectorIndex;
-	private readonly search: RetrievalService;
+	private readonly search: QueryRetriever;
 	/** Existing summaries are checked for missing vectors as soon as the service opens. */
 	readonly ready: Promise<void>;
 	/** Use a caller-owned database; an optional provider enables summary vectors and vsearch. */
 	constructor(db: DatabaseSync, options: MemoryServiceOptions = {}) {
 		this.db = db;
 		this.vectors = options.embedding ? new VectorIndex(db, options.embedding) : undefined;
-		this.search = options.search ?? createSearchService(db, "memory", options.embedding);
+		this.search = options.search ?? createRetriever(db, "memory", options.embedding);
 		this.ready =
 			options.backfill === false ? Promise.resolve() : (this.vectors?.syncEmbeddings("memory") ?? Promise.resolve());
 		// Standalone BM25 callers need not observe startup backfill; explicit vector calls still check readiness.

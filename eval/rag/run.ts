@@ -1,10 +1,9 @@
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { createEmbeddingProvider, createRerankingProvider } from "../../src/config.ts";
-import { isSearchMode } from "../../src/search/modes.ts";
-import { selectRetrievalOptions } from "../../src/search/strategies.ts";
-import { BeirDataset } from "./beir.ts";
-import { runRetrievalEval } from "./runner.ts";
+import { createEmbeddingProvider, createRerankingProvider } from "../../src/models/create-providers.ts";
+import { isSearchMode, selectRetrievalOptions } from "../../src/retrieval/strategies/registry.ts";
+import { BeirDataset } from "./datasets/beir.ts";
+import { runRetrievalEval } from "./workflow/runner.ts";
 
 // The composition entry point selects a concrete dataset adapter; runner.ts only knows DatasetLoader.
 const { values } = parseArgs({

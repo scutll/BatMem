@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from eval.rag.score_rag import score_results
+from eval.rag.scoring.score_rag import score_results
 
 
 class RetrievalMetricsTest(unittest.TestCase):

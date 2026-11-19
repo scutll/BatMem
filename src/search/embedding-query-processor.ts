@@ -1,18 +1,17 @@
-import { createRerankingProvider } from "../config.ts";
 import type { RerankingProvider } from "../reranking/provider.ts";
 import type { QueryProcessor } from "./processor.ts";
 import type { RecallResult, RetrievalHit, RetrievalQuery } from "./types.ts";
 
-/** Fuse recall rankings with RRF and a one-time best-rank bonus. Reranking is prepared but not invoked. */
+/** Fuse recall rankings, rerank candidates and blend model scores with fused ranks. */
 export class EmbeddingQueryProcessor<T extends RetrievalHit = RetrievalHit> implements QueryProcessor<T> {
-	/** Prepared for future reranking; absent when Jina credentials are not configured. */
+	/** Borrowed model provider, managed by the application entry point. */
 	readonly reranker: RerankingProvider | undefined;
 	private readonly rrfK: number;
 	private readonly candidateLimit: number;
 
 	constructor(reranker?: RerankingProvider, rrfK = 60) {
 		if (!Number.isSafeInteger(rrfK) || rrfK < 0) throw new Error("rrfK must be a nonnegative safe integer.");
-		this.reranker = reranker ?? createRerankingProvider();
+		this.reranker = reranker;
 		this.rrfK = rrfK;
 		this.candidateLimit = 40;
 	}
@@ -46,7 +45,6 @@ export class EmbeddingQueryProcessor<T extends RetrievalHit = RetrievalHit> impl
 			}
 		}
 
-
 		// bonus for higer ranking results, the first result earns 0.05
 		// 2nd/3rd result has 0.02 bonus
 		const Rrf_result = [...fused.values()]
@@ -57,30 +55,28 @@ export class EmbeddingQueryProcessor<T extends RetrievalHit = RetrievalHit> impl
 			.sort((a, b) => b.score - a.score)
 			.slice(0, Math.max(this.candidateLimit, request.topK));
 
-		const rerankCandidates: T[] = Rrf_result.map(({ hit }) => (hit));
+		const rerankCandidates: T[] = Rrf_result.map(({ hit }) => hit);
 
 		if (!rerankCandidates.length) return [];
 		if (!this.reranker) throw new Error("Reranker is not configured.");
 
 		const rerankResult = await this.reranker?.rerank(request.query, rerankCandidates, rerankCandidates.length);
 
-
 		// alpha differs with ranking, lower ranking chunks will have lower weight  on RRF scores,
 		// leaving more weight for rerank scores
-		return rerankResult?.map(({ index, score }) => {
-			const hit = rerankCandidates[index];
-			const rrfRank = index + 1;
+		return rerankResult
+			?.map(({ index, score }) => {
+				const hit = rerankCandidates[index];
+				const rrfRank = index + 1;
 
-			const alpha = rrfRank <= 3 ? 0.75
-				: rrfRank <= 10 ? 0.60
-					: 0.40;
+				const alpha = rrfRank <= 3 ? 0.75 : rrfRank <= 10 ? 0.6 : 0.4;
 
-			return {
-				...hit,
-				score: alpha / rrfRank + (1 - alpha) * score,
-			};
-		})
-		.sort((a, b) => b.score - a.score)
-		.slice(0, request.topK);
+				return {
+					...hit,
+					score: alpha / rrfRank + (1 - alpha) * score,
+				};
+			})
+			.sort((a, b) => b.score - a.score)
+			.slice(0, request.topK);
 	}
 }

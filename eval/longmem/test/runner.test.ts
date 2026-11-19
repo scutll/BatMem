@@ -6,6 +6,7 @@ import { afterEach, beforeEach, it } from "node:test";
 import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
 import { VectorIndex } from "../../../src/embedding/vector-index.ts";
 import { MemoryService } from "../../../src/memory/service.ts";
+import { BM25_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS, EMBEDDING_RECALL } from "../../../src/search/strategies.ts";
 import { openDatabase } from "../../../src/storage/db.ts";
 import { LongMemEvalDataset, parseSample } from "../longmemeval.ts";
 import {
@@ -154,7 +155,7 @@ it("builds searchable SQLite memory and writes answer artifacts only to the run 
 	assert.equal(calls, 1);
 	const db = openDatabase(join(prepared.project, ".pi", "docs-memory", "index.db"));
 	try {
-		assert.equal((await new MemoryService(db).searchSummaries({ query: "quasar", topK: 1 })).length, 1);
+		assert.equal((await new MemoryService(db).searchSummaries({ query: "quasar", topK: 1 }, BM25_RECALL)).length, 1);
 	} finally {
 		db.close();
 	}
@@ -205,7 +206,7 @@ it("reuses a summary build across search and vsearch and resumes failed vector b
 		},
 	};
 	const incompleteRun = join(root, "incomplete-vector-run");
-	await createEvaluationRun(incompleteRun, reused, "vsearch", embedding);
+	await createEvaluationRun(incompleteRun, reused, EMBEDDING_RECALL, embedding);
 	let answered = false;
 	await assert.rejects(
 		runMemoryEval(
@@ -216,7 +217,7 @@ it("reuses a summary build across search and vsearch and resumes failed vector b
 				return { text: "cat", usage: [], elapsedMs: 1 };
 			},
 			"memory",
-			"vsearch",
+			EMBEDDING_RECALL,
 			embedding,
 		),
 		/questions failed/,
@@ -229,7 +230,7 @@ it("reuses a summary build across search and vsearch and resumes failed vector b
 	assert.equal(summaries, 1);
 
 	const vectorRun = join(root, "vector-run");
-	const manifest = await createEvaluationRun(vectorRun, reused, "vsearch", embedding);
+	const manifest = await createEvaluationRun(vectorRun, reused, EMBEDDING_RECALL, embedding);
 	assert.equal(manifest.retrieval, "vsearch");
 	assert.equal(manifest.embedding?.identity, embedding.identity);
 	await runMemoryEval(
@@ -237,7 +238,7 @@ it("reuses a summary build across search and vsearch and resumes failed vector b
 		reused,
 		async () => ({ text: "cat", usage: [], elapsedMs: 1 }),
 		"memory",
-		"vsearch",
+		EMBEDDING_RECALL,
 		embedding,
 	);
 	assert.match(await readFile(join(vectorRun, "answers-memory.jsonl"), "utf8"), /"cat"/);
@@ -265,17 +266,20 @@ it("query reuses summaries and vectors and rejects incomplete indexes before ans
 	});
 	await writeFile(join(prepared.directory, "memory-ready.json"), JSON.stringify(config));
 	await assert.rejects(
-		createEvaluationRun(join(root, "no-provider"), build, "query"),
+		createEvaluationRun(join(root, "no-provider"), build, BM25_EMBEDDING_RRF_RERANK_OPTIONS),
 		/requires an embedding provider/,
 	);
 	const incompleteRun = join(root, "incomplete-query");
-	await createEvaluationRun(incompleteRun, build, "query", embedding);
+	await createEvaluationRun(incompleteRun, build, BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding);
 	let answered = false;
 	const answer = async () => {
 		answered = true;
 		return { text: "cat", usage: [], elapsedMs: 1 };
 	};
-	await assert.rejects(runMemoryEval(incompleteRun, build, answer, "memory", "query", embedding), /questions failed/);
+	await assert.rejects(
+		runMemoryEval(incompleteRun, build, answer, "memory", BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding),
+		/questions failed/,
+	);
 	assert.equal(answered, false);
 	await buildMemoryVectors(prepared, embedding);
 	await buildMemoryVectors(prepared, embedding);
@@ -283,15 +287,15 @@ it("query reuses summaries and vectors and rejects incomplete indexes before ans
 	assert.equal(summaries, 1);
 	assert.equal(await prepareMemoryBuild(prepared, JSON.stringify(config)), false);
 	const queryRun = join(root, "complete-query");
-	const manifest = await createEvaluationRun(queryRun, build, "query", embedding);
+	const manifest = await createEvaluationRun(queryRun, build, BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding);
 	assert.equal(manifest.buildFingerprint, build.manifest.fingerprint);
-	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "embedding-passthrough" });
+	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["bm25", "embedding"], processor: "rrf-rerank-blend" });
 	assert.ok(manifest.codeSha256?.["../../src/search/recall.ts"]);
 	assert.ok(manifest.codeSha256["../../src/search/bm25-embedding-recall.ts"]);
 	assert.ok(manifest.codeSha256["../../src/search/embedding-query-processor.ts"]);
 	const sourcePath = join(prepared.project, ".pi", "docs-memory", "index.db");
 	const before = await readFile(sourcePath);
-	await runMemoryEval(queryRun, build, answer, "memory", "query", embedding);
+	await runMemoryEval(queryRun, build, answer, "memory", BM25_EMBEDDING_RRF_RERANK_OPTIONS, embedding);
 	assert.equal(answered, true);
 	assert.deepEqual(await readFile(sourcePath), before);
 	assert.match(await readFile(join(queryRun, "answers-memory.jsonl"), "utf8"), /cat/);

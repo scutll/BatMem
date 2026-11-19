@@ -1,5 +1,4 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { SearchMode } from "../../src/search/types.ts";
 import type { MemorySample } from "./dataset.ts";
 
 export interface ImportedSession {
@@ -89,7 +88,7 @@ export interface EvaluationRunManifest {
 	buildDirectory: string;
 	buildFingerprint: string;
 	sampleDirectories: string[];
-	retrieval?: SearchMode;
+	retrieval?: string;
 	queryPipeline?: { recallPaths: string[]; processor: string };
 	codeSha256: Record<string, string>;
 	embedding?: { identity: string; dimensions: number };

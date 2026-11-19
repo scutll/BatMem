@@ -18,7 +18,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
 import registerBatMem from "../../src/index.ts";
-import type { SearchMode } from "../../src/search/types.ts";
+import type { RerankingProvider } from "../../src/reranking/provider.ts";
+import { BM25_RECALL } from "../../src/search/strategies.ts";
+import type { RetrievalOptions } from "../../src/search/types.ts";
 
 /** Observe evidence and the actual Pi system prompt without replacing either. No provider headers are logged. */
 export function createTraceExtension(trace: TraceEvent[]): (pi: ExtensionAPI) => void {
@@ -66,8 +68,9 @@ export async function createEvaluationSession(
 	trace: TraceEvent[],
 	useMemory = true,
 	storage?: EvaluationSessionStorage,
-	retrieval: SearchMode = "search",
+	retrieval: RetrievalOptions = BM25_RECALL,
 	embedding?: EmbeddingProvider | null,
+	reranking?: RerankingProvider | null,
 ): Promise<AgentSession> {
 	const agentDir = storage?.agentDirectory ?? join(cwd, ".agent-config");
 	const sessionDirectory = storage?.sessionDirectory ?? join(cwd, "sessions");
@@ -89,7 +92,15 @@ export async function createEvaluationSession(
 		noContextFiles: true,
 		extensionFactories: [
 			...(useMemory
-				? [(pi: ExtensionAPI) => registerBatMem(pi, { memorySearchMode: retrieval, evalMode: true, embedding })]
+				? [
+					(pi: ExtensionAPI) =>
+						registerBatMem(pi, {
+							retrieval: { defaultStrategy: retrieval.id, strategies: { [retrieval.id]: retrieval } },
+							evalMode: true,
+							embedding,
+							reranking,
+						}),
+				]
 				: []),
 			createTraceExtension(trace),
 		],

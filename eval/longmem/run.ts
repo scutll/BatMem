@@ -3,11 +3,13 @@ import { appendFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { createEmbeddingProvider } from "../../src/config.ts";
+import { createEmbeddingProvider, createRerankingProvider } from "../../src/config.ts";
 import type { JinaEmbeddingProvider } from "../../src/embedding/jina.ts";
 import { generateSessionSummary, SUMMARY_SYSTEM_PROMPT } from "../../src/memory/summary.ts";
+import type { JinaRerankingProvider } from "../../src/reranking/jina.ts";
 import { isSearchMode } from "../../src/search/modes.ts";
-import type { SearchMode } from "../../src/search/types.ts";
+import { selectRetrievalOptions } from "../../src/search/strategies.ts";
+import type { RetrievalOptions } from "../../src/search/types.ts";
 import { judgeAnswers } from "./judge.ts";
 import { LONG_MEM_EVAL_QUESTION_TYPES, LongMemEvalDataset } from "./longmemeval.ts";
 import { closeEvaluationSession, createEvaluationSession, runQuestion } from "./pi.ts";
@@ -57,14 +59,16 @@ const started = Date.now();
 console.info(`[eval] 阶段：${stage}；模式：${mode}；输出：${output}`);
 
 let build: PreparedBuild;
-let retrieval: SearchMode;
+let retrieval: RetrievalOptions;
 let embedding: JinaEmbeddingProvider | undefined;
+let reranking: JinaRerankingProvider | undefined;
 try {
 	if (stage === "prepare" || stage === "all") {
-		retrieval = requestedRetrieval;
-		if (retrieval !== "search" && mode === "no-memory") throw new Error(`${retrieval} requires memory mode.`);
-		embedding = retrieval !== "search" ? createEmbeddingProvider() : undefined;
-		if (retrieval !== "search" && !embedding) throw new Error(`${retrieval} requires JINA_API_KEY in BatMem/.env.`);
+		retrieval = selectRetrievalOptions(requestedRetrieval);
+		if (retrieval.requiresEmbedding && mode === "no-memory") throw new Error(`${retrieval.id} requires memory mode.`);
+		embedding = retrieval.requiresEmbedding ? createEmbeddingProvider() : undefined;
+		if (retrieval.requiresEmbedding && !embedding)
+			throw new Error(`${retrieval.id} requires JINA_API_KEY in BatMem/.env.`);
 		if (!values.dataset || !values.provider || !values.model)
 			throw new Error("Preparation requires --dataset, --provider and --model.");
 		const limit = Number(values.limit);
@@ -89,13 +93,13 @@ try {
 		console.info(`[prepare] run 已准备，引用 build：${build.manifest.fingerprint}`);
 	} else {
 		const run = await loadEvaluationRun(output);
-		retrieval = run.retrieval ?? "search";
-		if (values.retrieval && values.retrieval !== retrieval)
+		retrieval = selectRetrievalOptions(run.retrieval ?? "search");
+		if (values.retrieval && values.retrieval !== retrieval.id)
 			throw new Error("Retrieval mode differs from the run manifest.");
-		if (retrieval !== "search" && stage !== "judge") {
+		if (retrieval.requiresEmbedding && stage !== "judge") {
 			if (mode === "memory") {
 				embedding = createEmbeddingProvider();
-				if (!embedding) throw new Error(`${retrieval} requires JINA_API_KEY in BatMem/.env.`);
+				if (!embedding) throw new Error(`${retrieval.id} requires JINA_API_KEY in BatMem/.env.`);
 				if (embedding.identity !== run.embedding?.identity || embedding.dimensions !== run.embedding.dimensions)
 					throw new Error("Embedding configuration differs from the prepared run.");
 			}
@@ -106,7 +110,7 @@ try {
 			throw new Error("Run samples are not a prefix of the referenced build.");
 		build = { directory: run.buildDirectory, manifest, sampleDirectories: run.sampleDirectories };
 	}
-	console.info(`[eval] 检索：${retrieval}；build：${build.directory}`);
+	console.info(`[eval] 检索：${retrieval.id}；build：${build.directory}`);
 
 	if (stage !== "prepare") {
 		if (!values.provider || !values.model)
@@ -158,10 +162,11 @@ try {
 						`[build ${index + 1}/${build.sampleDirectories.length}] ${prepared.sample.id} 建库完成，已保存 memory-ready.json`,
 					);
 				}
-				if (retrieval !== "search" && embedding) await buildMemoryVectors(prepared, embedding);
+				if (retrieval.requiresEmbedding && embedding) await buildMemoryVectors(prepared, embedding);
 			}
 		}
 		if (stage === "answer" || stage === "all") {
+			reranking = mode === "memory" ? createRerankingProvider() : undefined;
 			await writeFile(
 				join(output, `answer-config-${mode}.json`),
 				JSON.stringify(
@@ -170,7 +175,7 @@ try {
 						timeoutMs,
 						systemPrompt: "Pi SDK default; actual prompt recorded in traces",
 						mode,
-						retrieval,
+						retrieval: retrieval.id,
 						embedding: embedding ? { identity: embedding.identity, dimensions: embedding.dimensions } : undefined,
 					},
 					null,
@@ -194,6 +199,7 @@ try {
 						},
 						retrieval,
 						embedding ?? null,
+						reranking ?? null,
 					);
 					try {
 						return await runQuestion(session, question, date, timeoutMs);
@@ -237,4 +243,5 @@ try {
 	console.info(`[eval] ${stage} 完成，总耗时 ${((Date.now() - started) / 1000).toFixed(1)}s`);
 } finally {
 	await embedding?.close();
+	await reranking?.close();
 }

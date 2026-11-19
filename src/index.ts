@@ -3,17 +3,17 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createEmbeddingProvider } from "./config.ts";
+import { createEmbeddingProvider, createRerankingProvider } from "./config.ts";
 import type { JinaEmbeddingProvider } from "./embedding/jina.ts";
 import type { EmbeddingProvider } from "./embedding/provider.ts";
 import { VectorIndex } from "./embedding/vector-index.ts";
 import { MemoryService } from "./memory/service.ts";
 import { generateSessionSummary } from "./memory/summary.ts";
 import { RAGService } from "./rag/service.ts";
-import { BM25Retriever } from "./search/bm25.ts";
-import { SearchService } from "./search/service.ts";
+import type { JinaRerankingProvider } from "./reranking/jina.ts";
+import { createSearchService } from "./search/create-service.ts";
+import { DEFAULT_STRATEGIES, selectRetrievalOptions } from "./search/strategies.ts";
 import type { RetrievalHit } from "./search/types.ts";
-import { VectorRetriever } from "./search/vector.ts";
 import { openDatabase } from "./storage/db.ts";
 import type { BatMemOptions } from "./types.ts";
 
@@ -23,21 +23,23 @@ import type { BatMemOptions } from "./types.ts";
  * Retrieval evidence is request-only and is never appended to persistent session entries.
  *
  * @param pi Host extension API. Registration itself performs no filesystem or model operations.
- * @param options.memorySearchMode Default for automatic summary recall and memory_search when its mode is omitted.
+ * @param options.retrieval Named strategies and the initial selection for all retrieval entry points.
  * @param options.evalMode Read an existing memory index without synchronization or document indexing.
  * @param options.embedding Borrowed provider, null to disable, or undefined to create an owned provider from configuration.
  */
 export default function registerExtension(pi: ExtensionAPI, options: BatMemOptions = {}): void {
-	const memorySearchMode = options.memorySearchMode ?? "search";
+	const strategies = { ...DEFAULT_STRATEGIES, ...options.retrieval?.strategies };
+	const initialStrategy = options.retrieval?.defaultStrategy ?? "search";
+	let activeStrategy = initialStrategy;
+	selectRetrievalOptions(initialStrategy, strategies);
 	const evalMode = options.evalMode ?? false;
 	let db: DatabaseSync | undefined;
 	let memory: MemoryService | undefined;
-	let evalSearch: SearchService | undefined;
 	let rag: RAGService | undefined;
 	let documentVectors: VectorIndex | undefined;
 	let provider: EmbeddingProvider | undefined;
 	let ownedProvider: JinaEmbeddingProvider | undefined;
-	let documentSearch: SearchService | undefined;
+	let ownedReranker: JinaRerankingProvider | undefined;
 	let scan: Promise<void> = Promise.resolve();
 	let pendingSummary: Promise<void> = Promise.resolve();
 	// One candidate per agent run, reused across its model calls and cleared before every new run.
@@ -47,6 +49,7 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 	pi.on("session_start", async (_event, ctx) => {
 		await Promise.all([scan, pendingSummary]);
 		await ownedProvider?.close();
+		await ownedReranker?.close();
 		db?.close();
 		candidate = undefined;
 		const directory = join(ctx.sessionManager.getCwd(), ".pi", "docs-memory");
@@ -56,21 +59,16 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 		// Credentials enable vector construction; BM25 remains the default tool/automatic search mode.
 		ownedProvider = options.embedding === undefined ? createEmbeddingProvider() : undefined;
 		provider = options.embedding === undefined ? ownedProvider : (options.embedding ?? undefined);
-		// Eval reads existing vectors without starting MemoryService's automatic backfill.
-		memory = new MemoryService(db, evalMode ? undefined : provider);
-		if (evalMode) {
-			evalSearch = new SearchService(
-				new BM25Retriever(db, "memory"),
-				provider ? new VectorRetriever(new VectorIndex(db, provider), provider, "memory") : undefined,
-			);
-			return;
-		}
-		rag = new RAGService(db, documents);
+		ownedReranker = options.reranking === undefined ? createRerankingProvider() : undefined;
+		const reranker = options.reranking === undefined ? ownedReranker : (options.reranking ?? undefined);
+		memory = new MemoryService(db, {
+			embedding: provider,
+			search: createSearchService(db, "memory", provider, reranker),
+			backfill: !evalMode,
+		});
+		if (evalMode) return;
+		rag = new RAGService(db, documents, { search: createSearchService(db, "document", provider, reranker) });
 		documentVectors = provider ? new VectorIndex(db, provider) : undefined;
-		documentSearch = new SearchService(
-			new BM25Retriever(db, "document"),
-			documentVectors && provider ? new VectorRetriever(documentVectors, provider, "document") : undefined,
-		);
 		const index = documentVectors;
 		pendingSummary = memory.ready.catch((error: unknown) => {
 			ctx.ui.notify(`Memory vector indexing failed: ${String(error)}`, "error");
@@ -111,12 +109,9 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 	pi.on("before_agent_start", async (event) => {
 		candidate = undefined;
 		if (event.messageType === "user") {
+			const selected = selectRetrievalOptions(activeStrategy, strategies);
 			const request = { query: event.prompt, topK: 1 };
-			candidate = (
-				evalMode
-					? await evalSearch?.[memorySearchMode](request)
-					: await memory?.searchSummaries(request, memorySearchMode)
-			)?.[0];
+			candidate = (await memory?.searchSummaries(request, selected))?.[0];
 		}
 	});
 
@@ -140,48 +135,57 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 	pi.on("session_shutdown", async () => {
 		await Promise.all([scan, pendingSummary]);
 		await ownedProvider?.close();
+		await ownedReranker?.close();
+		ownedReranker = undefined;
 		ownedProvider = undefined;
 		provider = undefined;
 		db?.close();
 		db = undefined;
 		memory = undefined;
-		evalSearch = undefined;
 		rag = undefined;
 		documentVectors = undefined;
-		documentSearch = undefined;
 		candidate = undefined;
+	});
+
+	pi.registerCommand("memory-strategy", {
+		description: "Show or select the retrieval strategy for memory and documents",
+		async handler(args, ctx) {
+			const name = args.trim();
+			if (!name) {
+				ctx.ui.notify(`Current: ${activeStrategy}. Available: ${Object.keys(strategies).join(", ")}`, "info");
+				return;
+			}
+			if (evalMode) throw new Error("Evaluation retrieval strategy is fixed.");
+			selectRetrievalOptions(name, strategies);
+			activeStrategy = name;
+			ctx.ui.notify(`Retrieval strategy: ${name}`, "info");
+		},
 	});
 
 	pi.registerTool({
 		name: "memory_search",
 		label: "Search session summaries",
 		description: evalMode
-			? `Search indexed session summaries. Evaluation retrieval is fixed to ${memorySearchMode}.`
+			? `Search indexed session summaries. Evaluation retrieval is fixed to ${initialStrategy}.`
 			: "Search indexed session summaries in this project.",
 		parameters: Type.Object({
 			query: Type.String(),
 			topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-			mode: Type.Optional(
-				Type.Union([Type.Literal("search"), Type.Literal("vsearch"), Type.Literal("query")], {
-					description: evalMode
-						? `Evaluation retrieval is fixed to ${memorySearchMode}; omit this parameter.`
-						: "search: BM25 (default); vsearch: vector; query: BM25 + vector recall with RRF fusion and a top-rank bonus. Vector modes require embeddings.",
+			strategy: Type.Optional(
+				Type.String({
+					description: `Retrieval strategy: ${Object.keys(strategies).join(", ")}. Omit to use the current selection.`,
 				}),
 			),
 		}),
 		async execute(_id, params) {
+			const selected = selectRetrievalOptions(
+				evalMode ? initialStrategy : (params.strategy ?? activeStrategy),
+				strategies,
+			);
 			await pendingSummary;
 			if (!memory) throw new Error("Memory database is not initialized.");
 			const request = { query: params.query, topK: params.topK ?? 5 };
-			// A dataset run must not mix retrieval strategies because the model supplied a tool argument.
-			const mode = evalMode ? memorySearchMode : (params.mode ?? memorySearchMode);
-			let hits: RetrievalHit[];
-			if (evalMode) {
-				if (!evalSearch) throw new Error("Evaluation search is not initialized.");
-				hits = await evalSearch[mode](request);
-			} else {
-				hits = await memory.searchSummaries(request, mode);
-			}
+			const hits = await memory.searchSummaries(request, selected);
 			return { content: [{ type: "text", text: JSON.stringify(hits) }], details: hits };
 		},
 	});
@@ -204,17 +208,20 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 		parameters: Type.Object({
 			query: Type.String(),
 			topK: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-			mode: Type.Optional(
-				Type.Union([Type.Literal("search"), Type.Literal("vsearch"), Type.Literal("query")], {
-					description:
-						"search: BM25 (default); vsearch: vector; query: BM25 + vector recall with RRF fusion and a top-rank bonus. Vector modes require embeddings.",
+			strategy: Type.Optional(
+				Type.String({
+					description: `Retrieval strategy: ${Object.keys(strategies).join(", ")}. Omit to use the current selection.`,
 				}),
 			),
 		}),
 		async execute(_id, params) {
+			const selected = selectRetrievalOptions(
+				evalMode ? initialStrategy : (params.strategy ?? activeStrategy),
+				strategies,
+			);
 			await scan;
-			if (!documentSearch) throw new Error("Document database is not initialized.");
-			const hits = await documentSearch[params.mode ?? "search"]({ query: params.query, topK: params.topK ?? 5 });
+			if (!rag) throw new Error("Document database is not initialized.");
+			const hits = await rag.searchChunks({ query: params.query, topK: params.topK ?? 5 }, selected);
 			return { content: [{ type: "text", text: JSON.stringify(hits) }], details: hits };
 		},
 	});

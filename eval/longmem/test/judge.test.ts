@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { it } from "node:test";
+import { selectRetrievalOptions } from "../../../src/search/strategies.ts";
 import type { MemorySample } from "../dataset.ts";
 import { createJudgePrompt, judgeAnswers, loadJudgePrompts, parseJudgeResponse, summarizeJudgments } from "../judge.ts";
 import { createEvaluationRun, prepareBuild } from "../runner.ts";
@@ -50,7 +51,7 @@ for (const retrieval of ["search", "query"] as const) {
 			await createEvaluationRun(
 				run,
 				build,
-				retrieval,
+				selectRetrievalOptions(retrieval),
 				retrieval === "query"
 					? {
 							identity: "test/judge-query:v1",

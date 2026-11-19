@@ -2,19 +2,21 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { createSearchService } from "../search/create-service.ts";
+import type { RetrievalOptions, RetrievalQuery, RetrievalService } from "../search/types.ts";
 import { chunkMarkdown } from "./chunker.ts";
-import { BM25Retriever } from "../search/bm25.ts";
-import type { DocumentChunk, DocumentRecord, DocumentRetrievalHit } from "./types.ts";
-import type { RetrievalQuery } from "../search/types.ts";
+import type { DocumentChunk, DocumentRecord, DocumentRetrievalHit, RAGServiceOptions } from "./types.ts";
 
 /** Local Markdown indexing and chunk retrieval. Source files are read, never modified. */
 export class RAGService {
 	private readonly db: DatabaseSync;
 	private readonly documentsDirectory: string;
+	private readonly search: RetrievalService;
 	/** Use a caller-owned initialized connection and one scan root; the root must exist when scanning. */
-	constructor(db: DatabaseSync, documentsDirectory: string) {
+	constructor(db: DatabaseSync, documentsDirectory: string, options: RAGServiceOptions = {}) {
 		this.db = db;
 		this.documentsDirectory = resolve(documentsDirectory);
+		this.search = options.search ?? createSearchService(db, "document");
 	}
 
 	/**
@@ -45,9 +47,9 @@ export class RAGService {
 		);
 	}
 
-	/** Search indexed chunks with higher-is-better BM25 scores; does not scan disk. */
-	searchChunks(request: RetrievalQuery): DocumentRetrievalHit[] {
-		return new BM25Retriever(this.db, "document").search(request) as DocumentRetrievalHit[];
+	/** Search indexed chunks with the caller's strategy; does not scan disk. */
+	async searchChunks(request: RetrievalQuery, options: RetrievalOptions): Promise<DocumentRetrievalHit[]> {
+		return (await this.search.retrieve(request, options)) as DocumentRetrievalHit[];
 	}
 
 	/** Collect sorted absolute .md paths, case-insensitively. Do not follow symlinks outside the scan root. */

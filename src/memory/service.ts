@@ -1,28 +1,29 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { EmbeddingProvider } from "../embedding/provider.ts";
 import { VectorIndex } from "../embedding/vector-index.ts";
-import { BM25Retriever } from "../search/bm25.ts";
-import { SearchService } from "../search/service.ts";
-import type { RetrievalHit, RetrievalQuery, SearchMode } from "../search/types.ts";
-import { VectorRetriever } from "../search/vector.ts";
-import type { IndexedMessage, SessionSnapshot, SessionSummary, SummaryGenerator } from "./types.ts";
+import { createSearchService } from "../search/create-service.ts";
+import type { RetrievalHit, RetrievalOptions, RetrievalQuery, RetrievalService } from "../search/types.ts";
+import type {
+	IndexedMessage,
+	MemoryServiceOptions,
+	SessionSnapshot,
+	SessionSummary,
+	SummaryGenerator,
+} from "./types.ts";
 
 /** Session indexing and retrieval independent of extension events and concrete model providers. */
 export class MemoryService {
 	private readonly db: DatabaseSync;
 	private readonly vectors?: VectorIndex;
-	private readonly search: SearchService;
+	private readonly search: RetrievalService;
 	/** Existing summaries are checked for missing vectors as soon as the service opens. */
 	readonly ready: Promise<void>;
 	/** Use a caller-owned database; an optional provider enables summary vectors and vsearch. */
-	constructor(db: DatabaseSync, embedding?: EmbeddingProvider) {
+	constructor(db: DatabaseSync, options: MemoryServiceOptions = {}) {
 		this.db = db;
-		this.vectors = embedding ? new VectorIndex(db, embedding) : undefined;
-		this.search = new SearchService(
-			new BM25Retriever(db, "memory"),
-			this.vectors && embedding ? new VectorRetriever(this.vectors, embedding, "memory") : undefined,
-		);
-		this.ready = this.vectors?.syncEmbeddings("memory") ?? Promise.resolve();
+		this.vectors = options.embedding ? new VectorIndex(db, options.embedding) : undefined;
+		this.search = options.search ?? createSearchService(db, "memory", options.embedding);
+		this.ready =
+			options.backfill === false ? Promise.resolve() : (this.vectors?.syncEmbeddings("memory") ?? Promise.resolve());
 		// Standalone BM25 callers need not observe startup backfill; explicit vector calls still check readiness.
 		void this.ready.catch(() => {});
 	}
@@ -62,15 +63,13 @@ export class MemoryService {
 	}
 
 	/**
-	 * Search current summaries. `search` uses FTS5 BM25; `vsearch` embeds the query and
-	 * retrieves stored summary vectors. `query` recalls both and currently returns embedding hits.
-	 * A missing or incomplete vector index rejects vector and query searches.
+	 * Search summaries with the caller's strategy; vector strategies wait for startup backfill.
 	 */
-	async searchSummaries(request: RetrievalQuery, mode: SearchMode = "search"): Promise<RetrievalHit[]> {
-		if (mode !== "search") {
+	async searchSummaries(request: RetrievalQuery, options: RetrievalOptions): Promise<RetrievalHit[]> {
+		if (options.requiresEmbedding) {
 			await this.ready.catch(() => {});
 		}
-		return this.search[mode](request);
+		return this.search.retrieve(request, options);
 	}
 
 	/**

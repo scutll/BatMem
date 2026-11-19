@@ -1,4 +1,8 @@
-import type { RetrievalHit } from "../search/types.ts";
+import type { RetrievalHit, RetrievalService } from "../search/types.ts";
+
+export interface RAGServiceOptions {
+	search?: RetrievalService;
+}
 
 /** Stored document identity and fingerprint; the original file is retained. */
 export interface DocumentRecord {

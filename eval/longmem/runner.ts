@@ -7,7 +7,8 @@ import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
 import { VectorIndex } from "../../src/embedding/vector-index.ts";
 import { MemoryService } from "../../src/memory/service.ts";
 import type { SummaryGenerator } from "../../src/memory/types.ts";
-import type { SearchMode } from "../../src/search/types.ts";
+import { BM25_RECALL } from "../../src/search/strategies.ts";
+import type { RetrievalOptions } from "../../src/search/types.ts";
 import { openDatabase } from "../../src/storage/db.ts";
 import type { MemoryDatasetLoader, MemorySample } from "./dataset.ts";
 import { loadSessionSnapshot, parseHistoryDate, writeHistorySessions } from "./sessions.ts";
@@ -62,6 +63,13 @@ async function collectCodeHashes(): Promise<Record<string, string>> {
 		"../../src/search/bm25.ts",
 		"../../src/search/vector.ts",
 		"../../src/search/service.ts",
+		"../../src/search/create-service.ts",
+		"../../src/search/strategies.ts",
+		"../../src/search/parallel-recall.ts",
+		"../../src/search/passthrough-processor.ts",
+		"../../src/reranking/provider.ts",
+		"../../src/reranking/jina.ts",
+		"../../src/reranking/types.ts",
 		"../../src/search/recall.ts",
 		"../../src/search/processor.ts",
 		"../../src/search/bm25-embedding-recall.ts",
@@ -254,10 +262,10 @@ export async function prepareBuild(
 export async function createEvaluationRun(
 	output: string,
 	build: PreparedBuild,
-	retrieval: SearchMode = "search",
+	retrieval: RetrievalOptions = BM25_RECALL,
 	embedding?: EmbeddingProvider,
 ): Promise<EvaluationRunManifest> {
-	if (retrieval !== "search" && !embedding) throw new Error(`${retrieval} requires an embedding provider.`);
+	if (retrieval.requiresEmbedding && !embedding) throw new Error(`${retrieval.id} requires an embedding provider.`);
 	const root = resolve(output);
 	await mkdir(dirname(root), { recursive: true });
 	await mkdir(root);
@@ -266,9 +274,10 @@ export async function createEvaluationRun(
 		buildDirectory: build.directory,
 		buildFingerprint: build.manifest.fingerprint,
 		sampleDirectories: build.sampleDirectories,
-		retrieval,
-		queryPipeline:
-			retrieval === "query" ? { recallPaths: ["bm25", "embedding"], processor: "embedding-passthrough" } : undefined,
+		retrieval: retrieval.id,
+		queryPipeline: retrieval.metadata
+			? { recallPaths: [...retrieval.metadata.recallPaths], processor: retrieval.metadata.processor }
+			: undefined,
 		codeSha256: await collectCodeHashes(),
 		embedding: embedding ? { identity: embedding.identity, dimensions: embedding.dimensions } : undefined,
 	};
@@ -399,7 +408,7 @@ export async function buildMemoryVectors(prepared: PreparedSample, embedding: Em
 		index.initialize();
 		const before = index.getStatus("memory");
 		console.info(`[vector ${prepared.sample.id}] 已有 ${before.indexed}/${before.total}；待生成 ${before.pending}`);
-		const memory = new MemoryService(db, embedding);
+		const memory = new MemoryService(db, { embedding });
 		const started = Date.now();
 		let lastLog = 0;
 		const timer = setInterval(() => {
@@ -438,11 +447,11 @@ export async function runMemoryEval(
 	build: PreparedBuild,
 	answer: AnswerQuestion,
 	mode: "memory" | "no-memory" = "memory",
-	retrieval: SearchMode = "search",
+	retrieval: RetrievalOptions = BM25_RECALL,
 	embedding?: EmbeddingProvider,
 ): Promise<void> {
-	if (mode === "memory" && retrieval !== "search" && !embedding)
-		throw new Error(`${retrieval} requires an embedding provider.`);
+	if (mode === "memory" && retrieval.requiresEmbedding && !embedding)
+		throw new Error(`${retrieval.id} requires an embedding provider.`);
 	const root = resolve(runDirectory);
 	const answersPath = join(root, `answers-${mode}.jsonl`);
 	await writeFile(answersPath, "", { flag: "wx" });
@@ -475,7 +484,7 @@ export async function runMemoryEval(
 				}
 				reconcileMemoryBuild({ ...prepared, project }, false);
 			}
-			if (mode === "memory" && retrieval !== "search" && embedding) {
+			if (mode === "memory" && retrieval.requiresEmbedding && embedding) {
 				const db = openDatabase(join(project, ".pi", "docs-memory", "index.db"));
 				try {
 					new VectorIndex(db, embedding).assertReady("memory", embedding);

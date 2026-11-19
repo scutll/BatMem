@@ -10,7 +10,7 @@ src/index.ts：生命周期与工具入口
   │    → MemoryService.syncSession() → 消息入库 → 增量摘要 → 摘要索引
   ├─ documents/*.md（递归）
   │    → RAGService.scanDocuments() → chunkMarkdown() → 文档块索引
-  └─ SearchService（限定 memory 或 document 来源）
+  └─ SearchService.retrieve(request, options)（限定来源）
        ├─ search  → BM25Retriever → SQLite FTS5
        ├─ vsearch → VectorRetriever → 查询编码 → VectorIndex → sqlite-vec
        └─ query   → 双路召回 → RRF 融合 → Jina 重排 → 混合评分
@@ -54,7 +54,7 @@ agent_end → 捕获 SessionSnapshot → 加入 pendingSummary 队列
 
 ### Agent 集成
 
-`before_agent_start` 每轮先清空候选，再对 `messageType === "user"` 的输入检索一个摘要，查询为 `event.prompt`。模式由 `memorySearchMode` 决定，默认 `search`；当前会话参与检索，直接选取排名第一的结果。
+`before_agent_start` 每轮先清空候选，再对 `messageType === "user"` 的输入检索一个摘要，查询为 `event.prompt`。策略由扩展当前选择决定，初始值取 `retrieval.defaultStrategy`，默认 `search`；当前会话参与检索，直接选取排名第一的结果。
 
 `context` 将候选 JSON 作为参考数据追加到本次模型请求的 User 消息中。同一轮的多次模型调用复用该候选，下一轮重新检索。追加内容仅存在于请求上下文中，不写入 Session。
 
@@ -81,7 +81,7 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 替换或删除通过触发器清理旧全文索引和向量。扫描失败时保留已提交的文件更新，并跳过删除清理；向量生成失败时，已保存文本和全文索引继续可用。
 
-`rag_search` 等待启动扫描结束，返回文档块、分数、Document ID、路径、块序号、行号和章节。同一文档可命中多个块，Agent 使用宿主 `read` 工具按路径和行号读取更多上下文。
+`rag_search` 等待启动扫描结束，将 Options 传给 `RAGService.searchChunks(request, options)`，由注入的 `RetrievalService` 执行检索。结果包含文档块、分数、Document ID、路径、块序号、行号和章节。同一文档可命中多个块，Agent 使用宿主 `read` 工具按路径和行号读取更多上下文。
 
 ## 存储与 Jina HTTP 服务
 
@@ -123,7 +123,7 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 ### 公共接口与模式
 
-`SearchService` 接收 `{ query, topK }`，异步返回 `RetrievalHit[]`。统一字段为 `text`、`score`、`sourceType`、`sourceId` 和 `location`；摘要携带消息游标与更新时间，文档块携带块序号、行号和章节。会话与文档分别检索，各模式均按高分优先。
+`RetrievalService` 定义统一的 `retrieve(request, options)`，`SearchService` 实现该接口，接收 `{ query, topK }` 和上层选择的 `RetrievalOptions`，异步返回 `RetrievalHit[]`。统一字段为 `text`、`score`、`sourceType`、`sourceId` 和 `location`；摘要携带消息游标与更新时间，文档块携带块序号、行号和章节。会话与文档分别检索，各模式均按高分优先。
 
 | 模式 | 执行路径 | 分数 |
 | --- | --- | --- |
@@ -133,12 +133,20 @@ scanDocuments() → indexDocument() → 内容哈希比较
 
 BM25 提取字母、数字、下划线组成的词项，逐项加引号，用 OR 连接后执行 FTS5 MATCH，使用 SQLite 默认分词器。向量检索使用原始查询编码，在编码前后检查来源索引完整性与配置，再通过 sqlite-vec 精确扫描该来源的向量。
 
+### Options 装配与选择
+
+`src/search/strategies.ts` 声明内置 Options：`search` 使用单路 BM25，`vsearch` 使用单路向量，两者配置 `PassthroughProcessor`；`query` 使用双路召回和融合重排。`RetrievalOptions` 包含 ID、依赖需求、可选评测描述和两个工厂，接口位于 `search/types.ts`。
+
+Extension 在注册时合并内置策略与 `retrieval.strategies`，在 `session_start` 通过 `createSearchService()` 创建来源限定的服务。每次调用开始时按“工具 strategy 参数 → 当前策略 → 启动默认策略”选择 Options，传给服务；`/memory-strategy <名称>` 切换后续自动召回和工具检索，省略名称时查看当前选择。切换复用服务、索引和 Provider，进行中的调用继续使用原来的执行对象。
+
+RAG Eval 的 CLI 在 `eval/rag/run.ts` 选择 Options，LongMemEval 在 `eval/longmem/run.ts` 选择，再经评测会话入口传入 Extension。程序调用可传递自定义 Options。Eval 根据 `requiresEmbedding` 判断向量构建需求，从 ID 和 metadata 保存策略描述。
+
 ### 多路召回
 
 默认 `query` 由 `BM25EmbeddingRecall` 和 `EmbeddingQueryProcessor` 组成：
 
 ```text
-SearchService.query(request)
+SearchService.retrieve(request, HYBRID_OPTIONS)
   → BM25EmbeddingRecall.recall(request)
       ├─ bm25：BM25Retriever.retrieve(request副本)
       └─ embedding：VectorRetriever.retrieve(request副本)
@@ -148,7 +156,7 @@ SearchService.query(request)
       → reranker.rerank() → 混合评分 → 排序 → topK
 ```
 
-两路各自最多召回 `request.topK` 项。`QueryRecall` 为每路提供独立请求副本，等待所有任务结束；任一路失败时抛出 `AggregateError`。`SearchService` 也可接收自定义 `QueryPipeline`，通过 `QueryRecall` 注册其他召回任务，再交给 Processor 处理。
+两路各自最多召回 `request.topK` 项。`ParallelRecall` 为每路提供独立请求副本，等待所有任务结束；任一路失败时抛出 `AggregateError`。`QueryRecall` 是召回接口，`ParallelRecall` 接收 `{ path, run }[]`；路径可在 `run()` 中扩写查询或处理结果。`RetrievalOptions.createRecall` 和 `createProcessor` 每次创建执行对象，Processor 接收原始请求。
 
 ### RRF 去重与融合
 
@@ -177,14 +185,14 @@ alpha(r)：第 1～3 名为 0.75，第 4～10 名为 0.60，其后为 0.40
 
 | 入口 | 行为 |
 | --- | --- |
-| `session_start` | 等待旧扫描与同步任务，关闭旧自有 embedding 连接和数据库；打开项目数据库，创建服务，启动摘要向量补建、文档扫描及向量同步 |
+| `session_start` | 等待旧扫描与同步任务，关闭旧自有 embedding、reranker 连接和数据库；打开项目数据库，创建服务，启动摘要向量补建、文档扫描及向量同步 |
 | `before_agent_start` / `context` | 检索一个摘要，并临时注入本轮模型请求 |
 | `agent_end` | 通过 `pendingSummary` 串行同步会话，等待摘要与向量处理结束 |
-| `memory_search` | 等待 `pendingSummary`，按模式检索摘要；默认模式取 `memorySearchMode` |
+| `memory_search` | 等待 `pendingSummary`，按调用开始时选择的 Options 检索摘要 |
 | `memory_read` | 按 Session ID 与关键词读取最新三条匹配消息 |
-| `rag_search` | 等待扫描任务，按模式检索文档块；默认模式为 `search` |
-| `session_shutdown` | 等待扫描与同步结束，关闭自有 embedding 连接及数据库，清空服务和候选 |
+| `rag_search` | 等待扫描任务，按调用开始时选择的 Options 检索文档块 |
+| `session_shutdown` | 等待扫描与同步结束，关闭自有 embedding、reranker 连接及数据库，清空服务和候选 |
 
-两个搜索工具的 `topK` 默认 5，允许 1～100。扩展选项 `memorySearchMode` 默认 `search`；`embedding` 未指定时读取配置，传入 provider 时由调用方管理，传入 `null` 时停用。默认 query Processor 独立读取配置创建 reranker，也支持直接构造时注入；扩展关闭流程目前只管理自有 embedding provider 的连接。
+两个搜索工具的 `topK` 默认 5，允许 1～100。扩展的 `retrieval.defaultStrategy` 默认 `search`。`embedding`、`reranking` 未指定时由扩展读取配置并管理连接，传入 provider 时由调用方管理，传入 `null` 时停用默认配置读取。Processor 接收上层提供的 reranker。
 
-`evalMode` 读取已有记忆索引，跳过摘要向量补建、文档扫描和会话同步；自动检索与 `memory_search` 固定使用 `memorySearchMode`。后台扫描、摘要同步和向量构建错误通过 UI 通知，底层检索错误向调用方传播。
+`evalMode` 读取已有记忆索引，跳过摘要向量补建、文档扫描和会话同步；自动检索与 `memory_search` 固定使用初始化时选定的 Options。后台扫描、摘要同步和向量构建错误通过 UI 通知，底层检索错误向调用方传播。

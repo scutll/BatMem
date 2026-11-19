@@ -149,16 +149,17 @@
 
 | 文件 | 覆盖 |
 | --- | --- |
+| `test/retrieval-options.test.ts` | Options 工厂按次创建、运行中切换、run 内扩写、原始请求隔离与单路透传约束 |
 | `test/query.test.ts` | 三路并发启动、等待全部结束、同步/异步失败后排空任务、请求与并发调用隔离、路径校验、Processor 透传和错误传播 |
-| `test/search.test.ts` | query 与真实 sqlite-vec 排名一致，BM25 排名不同不影响输出；保留不同 chunk 坐标，索引不完整时不编码查询 |
+| `test/search.test.ts` | 统一 Options 入口验证 BM25、向量与混合检索，融合后保留来源坐标；保留不同 chunk 坐标，索引不完整时不编码查询 |
 | `test/memory.test.ts` | query 等待启动补建，摘要游标正确，正文变化后拒绝不完整向量 |
 | `test/extension.test.ts` | 普通 memory_search/rag_search 的 query 路径与无 provider 错误，调用方保留 provider 所有权 |
-| `eval/rag/test/eval.test.ts` | search/vsearch/query 共享 build，query 与 vsearch 导出一致，记录 pipeline 与源码哈希，失败不发布完成 manifest |
+| `eval/rag/test/eval.test.ts` | search/vsearch/query 共享 build，query 与 vsearch 分别导出各自分数和排名，记录 pipeline 与源码哈希，失败不发布完成 manifest |
 | `eval/longmem/test/runner.test.ts` | query 复用摘要和向量，完整性检查在回答前执行，缓存与 run 副本隔离 |
-| `eval/longmem/test/pi.test.ts` | 真实 Pi SDK + faux 模型 + 固定向量，query 自动注入与工具搜索，模型传入其他 mode 不改变固定评测模式 |
+| `eval/longmem/test/pi.test.ts` | 真实 Pi SDK + faux 模型 + 固定向量，query 自动注入与工具搜索，工具传入其他 strategy 不改变固定评测策略 |
 | `eval/longmem/test/judge.test.ts` | query 标识进入指标，Judge 不调用 embedding |
 
-并发测试使用明确的任务启动信号和可控 Promise，不用 sleep 或耗时推断。query 的输出与 vsearch 相同只证明透传行为；另行检查两路执行及完整汇总。
+并发测试使用明确的任务启动信号和可控 Promise，不用 sleep 或耗时推断。单路策略保留底层分数，混合策略独立验证融合、重排和权重边界；Options 测试覆盖请求内改写、运行中切换和执行对象隔离。
 
 现有测试命令如下，从 BatMem 目录执行；新增测试文件落地后同步补充。
 

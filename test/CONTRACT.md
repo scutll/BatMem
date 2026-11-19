@@ -12,19 +12,20 @@ node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embed
 
 ## 公共接口
 
-类型从对应契约文件导入：搜索为 `src/search/types.ts` 和 `src/search/processor.ts`，Embedding 配置及索引记录为 `src/embedding/types.ts`，扩展选项为 `src/types.ts`，Eval 运行接口为各自目录下的 `types.ts`。`QueryRecall` 抽象基类位于 `recall.ts`，具体组合位于 `bm25-embedding-recall.ts`；Processor 具体实现位于 `embedding-query-processor.ts`。实现文件不再兼容转导出已迁移的接口。
+类型从对应契约文件导入：搜索为 `src/search/types.ts` 和 `src/search/processor.ts`，Embedding 配置及索引记录为 `src/embedding/types.ts`，扩展选项为 `src/types.ts`，Eval 运行接口为各自目录下的 `types.ts`。`QueryRecall` 接口位于 `recall.ts`，并发调度由 `parallel-recall.ts` 实现，具体组合位于 `bm25-embedding-recall.ts`；Processor 具体实现位于 `embedding-query-processor.ts`。实现文件不再兼容转导出已迁移的接口。
 
 - `openDatabase(path)` 创建父目录并初始化文本、FTS5 和向量元数据表，返回由调用方关闭的
   `node:sqlite` 连接。
-- `MemoryService(db, embedding?)` 可接收 Mock embedding provider。`syncSession(snapshot, summarize)`
+- `MemoryService(db, { embedding?, search?, backfill? })` 可接收 Mock embedding provider。`syncSession(snapshot, summarize)`
   接收完整线性 Session 快照。首次摘要使用全部有效消息，增量摘要只使用旧摘要和游标之后的消息；
   模型失败不推进摘要游标。已配置 provider 时，摘要保存后补建向量；无新消息时也补建缺失向量。
-  创建服务时通过 `ready` 等待已有摘要的向量补建。`searchSummaries(request, mode?)` 异步返回
+  创建服务时通过 `ready` 等待已有摘要的向量补建。`searchSummaries(request, options)` 异步返回
   BM25（默认）、向量检索或 query 结果；query 等待启动向量补建。
 - `MemoryService.readMessages(sessionId, keyword)` 按字面子串返回最近三条 User/Assistant 原文，
   不返回 Tool Result。
 - `RAGService.scanDocuments()` 递归维护 Markdown 文档；`replaceDocumentIndex()` 可直接写入已准备的
   Chunk，不强制重新切块。
+- `RAGService(db, directory, { search? })` 接收来源限定的检索接口，`searchChunks(request, options)` 异步委托同一检索流程。
 - `chunkMarkdown(text)` 生成最多 500 个 UTF-16 code unit、重叠 100 的 Chunk，并保留行号和章节。
 - `BM25Retriever(db, source).retrieve({ query, topK })` 按 `memory` 或 `document` 查询 FTS5。
   SQLite 原生 BM25 取负后返回，因此分数越大越相关。
@@ -35,16 +36,13 @@ node --test test/memory.test.ts test/rag.test.ts test/chunker.test.ts test/embed
 - `VectorIndex.getStatus(source)` 返回 `{ total, indexed, pending }`。`search(source, vector, topK)`
   仅在配置匹配且该来源完整时执行真实 sqlite-vec 余弦查询，返回分数降序结果。
 - `VectorRetriever` 在 query 编码前检查索引状态，编码后再次检查，再执行来源限定的向量查询。
-- `SearchService.search()` 只调用 BM25 Retriever；`vsearch()` 只调用 Vector Retriever。向量未配置
-  或失败时明确报错，不静默返回 BM25 结果。
-- `SearchService.query()` 默认使用 `BM25EmbeddingRecall` 并发执行 BM25 与 embedding 任务，
-  `QueryRecall` 抽象类允许子类注册任意数量的 `{ path, run: async request => hits }`。
-  各路请求独立，全部结束后按注册顺序汇总 `RecallResult[]`；失败时汇总错误，不执行 Processor。
+- `SearchService.retrieve(request, options)` 统一执行 Options 的 Recall 与 Processor 工厂，每次调用创建执行对象并按最终 topK 截取。BM25 与向量使用单路透传，混合策略使用双路融合重排。切换不重建服务或 Provider。
+- `ParallelRecall(tasks)` 接收 `{ path, run }[]`；路径可改写查询、处理结果，各路请求独立，全部结束后按声明顺序汇总。失败时排空任务并抛出错误。
 - `QueryProcessor.process(request, results)` 接收原始请求与全部成功路径。
   `EmbeddingQueryProcessor` 每路先按来源身份去重、保留首次命中，再以去重后的排名计算
   `1 / (60 + rank)`；跨路累加并记录最好排名，第 1 名加 `0.05`、第 2～3 名加 `0.02`，
   奖励只加一次，按融合分降序选取前 `max(40, topK)` 个候选，不修改输入。
-  构造时可注入 reranker，否则沿用 embedding 的 Jina 密钥和代理配置创建；没有密钥时为空。
+  构造时接收上层注入的 reranker，Processor 不读取环境或创建连接。
   非空候选必须配置 reranker；请求全部候选的分数，以响应 index 映射回候选。
   最终分数为 `alpha / r + (1 - alpha) * rerankScore`，r 是从 1 开始的 RRF 排名；
   排名 1～3 的 alpha 为 `0.75`，4～10 为 `0.60`，其余为 `0.40`。
@@ -63,3 +61,5 @@ RAG 测试会先把 `testDocs` 复制到临时目录。目录不存在时使用 
 
 固定向量只验证请求、存储、失效、排名和来源映射，不证明真实 Jina 模型的语义召回质量。
 真实 BEIR 和 LongMemEval 由 eval 命令单独运行。
+
+Options 的请求隔离、run 内改写、单路透传约束和未知名称由 `test/retrieval-options.test.ts` 覆盖；Extension 测试验证命令切换、工具临时覆盖、自定义无向量策略与自动注入。

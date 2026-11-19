@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, it, mock } from "node:test";
+import { afterEach, beforeEach, it } from "node:test";
 import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
+import { ParallelRecall } from "../../../src/search/parallel-recall.ts";
+import { BM25_RECALL, EMBEDDING_RECALL } from "../../../src/search/strategies.ts";
+import type { RetrievalOptions } from "../../../src/search/types.ts";
 import { openDatabase } from "../../../src/storage/db.ts";
-import { mockReranking } from "../../../test/helpers/reranking.ts";
+import { OFFLINE_HYBRID_OPTIONS } from "../../../test/helpers/reranking.ts";
 import { BeirDataset, loadQueries } from "../beir.ts";
 import type { DatasetLoader } from "../dataset.ts";
 import { runRetrievalEval } from "../runner.ts";
@@ -14,7 +17,6 @@ let root: string;
 let dataset: string;
 let output: string;
 beforeEach(async () => {
-	mockReranking(mock);
 	root = await mkdtemp(join(tmpdir(), "batmem-eval-"));
 	dataset = join(root, "dataset");
 	output = join(root, "run");
@@ -44,7 +46,6 @@ beforeEach(async () => {
 	);
 });
 afterEach(async () => {
-	mock.restoreAll();
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -63,7 +64,7 @@ it("runs an in-memory adapter without BEIR files or title preparation in the run
 			return [{ id: "custom-query", text: "quasar", qrels: { "custom-id": 1 } }];
 		},
 	};
-	await runRetrievalEval({ loader, output });
+	await runRetrievalEval({ loader, output, retrieval: BM25_RECALL });
 	const row = JSON.parse((await readFile(join(output, "retrieval.jsonl"), "utf8")).trim());
 	assert.equal(row.hits[0].document_id, "custom-id");
 	assert.equal(row.hits[0].text, "quasar\nexact prepared text");
@@ -73,7 +74,7 @@ it("runs an in-memory adapter without BEIR files or title preparation in the run
 });
 
 it("indexes whole records with original IDs and exports all judged queries, including no matches", async () => {
-	await runRetrievalEval({ loader: new BeirDataset(dataset), output, topK: 2 });
+	await runRetrievalEval({ retrieval: BM25_RECALL, loader: new BeirDataset(dataset), output, topK: 2 });
 	const rows = (await readFile(join(output, "retrieval.jsonl"), "utf8"))
 		.trim()
 		.split("\n")
@@ -92,18 +93,27 @@ it("indexes whole records with original IDs and exports all judged queries, incl
 	const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
 	assert.equal(manifest.query_count, 2);
 	assert.equal(Object.keys(manifest.input_sha256).length, 3);
-	await assert.rejects(runRetrievalEval({ loader: new BeirDataset(dataset), output }), /EEXIST/);
+	await assert.rejects(
+		runRetrievalEval({ retrieval: BM25_RECALL, loader: new BeirDataset(dataset), output }),
+		/EEXIST/,
+	);
 });
 
 it("rejects missing corpus evidence and leaves no completed manifest", async () => {
 	await writeFile(join(dataset, "qrels", "test.tsv"), "query-id\tcorpus-id\tscore\nq1\tmissing\t1\n");
-	await assert.rejects(runRetrievalEval({ loader: new BeirDataset(dataset), output }), /missing corpus ID/);
+	await assert.rejects(
+		runRetrievalEval({ retrieval: BM25_RECALL, loader: new BeirDataset(dataset), output }),
+		/missing corpus ID/,
+	);
 	await assert.rejects(readFile(join(output, "manifest.json")), /ENOENT/);
 });
 
 it("rejects duplicate corpus IDs rather than overwriting benchmark records", async () => {
 	await writeFile(join(dataset, "corpus.jsonl"), '{"_id":"x","text":"a"}\n{"_id":"x","text":"b"}');
-	await assert.rejects(runRetrievalEval({ loader: new BeirDataset(dataset), output }), /Duplicate corpus ID/);
+	await assert.rejects(
+		runRetrievalEval({ retrieval: BM25_RECALL, loader: new BeirDataset(dataset), output }),
+		/Duplicate corpus ID/,
+	);
 });
 
 it("rejects invalid records, unknown query references and duplicate judgments", async () => {
@@ -136,19 +146,31 @@ it("query reuses vector builds and exports fused rankings with explicit pipeline
 	const baseline = join(root, "bm25");
 	const vectorRun = join(root, "vector");
 	const loader = new BeirDataset(dataset);
-	await runRetrievalEval({ loader, output: baseline, builds, topK: 2 });
-	await runRetrievalEval({ loader, output: vectorRun, builds, topK: 2, mode: "vsearch", embedding });
-	await runRetrievalEval({ loader, output, builds, topK: 2, mode: "query", embedding });
+	await runRetrievalEval({ loader, output: baseline, builds, topK: 2, retrieval: BM25_RECALL });
+	await runRetrievalEval({ loader, output: vectorRun, builds, topK: 2, retrieval: EMBEDDING_RECALL, embedding });
+	await runRetrievalEval({ loader, output, builds, topK: 2, retrieval: OFFLINE_HYBRID_OPTIONS, embedding });
 	assert.equal(encoded, 2);
 	assert.equal(queries, 4);
 	const text = await readFile(join(output, "retrieval.jsonl"), "utf8");
-	const rows = text.trim().split("\n").map((line) => JSON.parse(line));
-	assert.deepEqual(rows[0].hits.map((hit: { document_id: string }) => hit.document_id), ["doc/string-1", "d2"]);
-	assert.deepEqual(rows[1].hits.map((hit: { document_id: string }) => hit.document_id), ["d2", "doc/string-1"]);
-	assert.deepEqual(rows.map((row) => row.hits.map((hit: { score: number }) => hit.score)), [
-		[0.75, 0.375],
-		[0.75, 0.375],
-	]);
+	const rows = text
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	assert.deepEqual(
+		rows[0].hits.map((hit: { document_id: string }) => hit.document_id),
+		["doc/string-1", "d2"],
+	);
+	assert.deepEqual(
+		rows[1].hits.map((hit: { document_id: string }) => hit.document_id),
+		["d2", "doc/string-1"],
+	);
+	assert.deepEqual(
+		rows.map((row) => row.hits.map((hit: { score: number }) => hit.score)),
+		[
+			[0.75, 0.375],
+			[0.75, 0.375],
+		],
+	);
 	assert.notEqual(text, await readFile(join(vectorRun, "retrieval.jsonl"), "utf8"));
 	assert.notEqual(text, await readFile(join(baseline, "retrieval.jsonl"), "utf8"));
 	const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
@@ -172,7 +194,7 @@ it("query reuses vector builds and exports fused rankings with explicit pipeline
 		loader,
 		output: recoveredRun,
 		builds,
-		mode: "query",
+		retrieval: OFFLINE_HYBRID_OPTIONS,
 		embedding: {
 			...embedding,
 			async embedQuery() {
@@ -185,7 +207,33 @@ it("query reuses vector builds and exports fused rankings with explicit pipeline
 	assert.equal(JSON.parse(await readFile(join(recoveredRun, "manifest.json"), "utf8")).status, "complete");
 	assert.equal(encoded, 2);
 	await assert.rejects(
-		runRetrievalEval({ loader, output: join(root, "missing-provider"), mode: "query" }),
+		runRetrievalEval({ loader, output: join(root, "missing-provider"), retrieval: OFFLINE_HYBRID_OPTIONS }),
 		/requires an embedding provider/,
 	);
+});
+
+it("runs custom lexical options without embeddings and records their metadata", async () => {
+	const selected: RetrievalOptions = {
+		...BM25_RECALL,
+		id: "expanded-lexical",
+		metadata: { recallPaths: ["rewritten"], processor: "passthrough", score: "BM25 after query rewrite" },
+		createRecall: ({ bm25 }) =>
+			new ParallelRecall([
+				{
+					path: "rewritten",
+					run: async (request) => bm25.retrieve({ ...request, query: "transactions" }),
+				},
+			]),
+	};
+	await runRetrievalEval({ loader: new BeirDataset(dataset), output, retrieval: selected });
+	const rows = (await readFile(join(output, "retrieval.jsonl"), "utf8"))
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	assert.ok(rows.every((row) => row.hits[0].document_id === "d2"));
+	const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+	assert.equal(manifest.retriever, selected.id);
+	assert.deepEqual(manifest.queryPipeline, { recallPaths: ["rewritten"], processor: "passthrough" });
+	assert.equal(manifest.score, selected.metadata?.score);
+	assert.equal(manifest.embedding, undefined);
 });

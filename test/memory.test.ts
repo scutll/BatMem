@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { EmbeddingProvider } from "../src/embedding/provider.ts";
 import { MemoryService } from "../src/memory/service.ts";
+import { BM25_RECALL, EMBEDDING_RECALL } from "../src/search/strategies.ts";
 import { openDatabase } from "../src/storage/db.ts";
-import { mockReranking } from "./helpers/reranking.ts";
+import { OFFLINE_HYBRID_OPTIONS } from "./helpers/reranking.ts";
 
 // Construct session-shaped inputs; no session files or real model requests are needed.
 function createUserMessage(id: string, parentId: string | null, text: string, second = 0): SessionEntry {
@@ -70,14 +71,12 @@ describe("cross-session memory", () => {
 	let memory: MemoryService;
 
 	beforeEach(async () => {
-		mockReranking(mock);
 		directory = await mkdtemp(join(tmpdir(), "batmem-memory-"));
 		db = openDatabase(join(directory, "nested", "index.db"));
 		memory = new MemoryService(db);
 	});
 
 	afterEach(async () => {
-		mock.restoreAll();
 		db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
@@ -95,7 +94,7 @@ describe("cross-session memory", () => {
 		assert.match(input, /USER_MARKER/);
 		assert.match(input, /ASSISTANT_MARKER/);
 		assert.match(input, /TOOL_MARKER/);
-		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 });
+		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 }, BM25_RECALL);
 		assert.equal(hits.length, 1);
 		assert.equal(hits[0].text, "quasar deployment decision");
 		assert.equal(hits[0].sourceType, "memory");
@@ -117,7 +116,7 @@ describe("cross-session memory", () => {
 		assert.match(input, /PREVIOUS_SUMMARY/);
 		assert.match(input, /NEW_RAW_MARKER/);
 		assert.doesNotMatch(input, /OLD_RAW_MARKER/);
-		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 });
+		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 }, BM25_RECALL);
 		assert.equal(hits.length, 1);
 		assert.equal(hits[0].text, "updated quasar summary");
 		assert.equal(hits[0].location.entryId, "u2");
@@ -130,7 +129,7 @@ describe("cross-session memory", () => {
 		await memory.syncSession(state, summarize);
 		assert.equal(summarize.mock.callCount(), 1);
 		assert.equal(memory.readMessages("session-a", "quasar").length, 1);
-		assert.equal((await memory.searchSummaries({ query: "quasar", topK: 10 })).length, 1);
+		assert.equal((await memory.searchSummaries({ query: "quasar", topK: 10 }, BM25_RECALL)).length, 1);
 	});
 
 	it("indexes each new summary and retries a failed vector without regenerating the summary", async () => {
@@ -153,29 +152,35 @@ describe("cross-session memory", () => {
 				return [0, 1];
 			},
 		};
-		memory = new MemoryService(db, embedding);
+		memory = new MemoryService(db, { embedding: embedding });
 		const first = createUserMessage("u1", null, "first event");
 		const snapshot = createSessionSnapshot([first]);
 		const summarize = mock.fn(async () => "initial summary");
 		await memory.syncSession(snapshot, summarize);
 		assert.deepEqual(encoded, ["initial summary"]);
-		assert.equal((await memory.searchSummaries({ query: "initial", topK: 1 }))[0].sourceId, "session-a");
+		assert.equal((await memory.searchSummaries({ query: "initial", topK: 1 }, BM25_RECALL))[0].sourceId, "session-a");
 		assert.deepEqual(queries, []);
-		assert.equal((await memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"))[0].sourceId, "session-a");
+		assert.equal(
+			(await memory.searchSummaries({ query: "unrelated", topK: 1 }, EMBEDDING_RECALL))[0].sourceId,
+			"session-a",
+		);
 		assert.deepEqual(queries, ["unrelated"]);
 
 		const updated = createSessionSnapshot([first, createUserMessage("u2", "u1", "second event", 1)]);
 		const updateSummary = mock.fn(async () => "updated summary");
 		failNext = true;
 		await assert.rejects(memory.syncSession(updated, updateSummary), /embedding unavailable/);
-		assert.equal((await memory.searchSummaries({ query: "updated", topK: 1 }))[0].location.entryId, "u2");
-		await assert.rejects(memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"), /incomplete/);
+		assert.equal((await memory.searchSummaries({ query: "updated", topK: 1 }, BM25_RECALL))[0].location.entryId, "u2");
+		await assert.rejects(memory.searchSummaries({ query: "unrelated", topK: 1 }, EMBEDDING_RECALL), /incomplete/);
 		assert.deepEqual(queries, ["unrelated"]);
 
 		await memory.syncSession(updated, updateSummary);
 		assert.equal(updateSummary.mock.callCount(), 1);
 		assert.deepEqual(encoded, ["initial summary", "updated summary", "updated summary"]);
-		assert.equal((await memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"))[0].text, "updated summary");
+		assert.equal(
+			(await memory.searchSummaries({ query: "unrelated", topK: 1 }, EMBEDDING_RECALL))[0].text,
+			"updated summary",
+		);
 		assert.deepEqual(queries, ["unrelated", "unrelated"]);
 	});
 
@@ -194,11 +199,11 @@ describe("cross-session memory", () => {
 				return [1, 0];
 			},
 		};
-		memory = new MemoryService(db, embedding);
+		memory = new MemoryService(db, { embedding: embedding });
 		await memory.ready;
 		assert.deepEqual(encoded, ["existing summary"]);
 		assert.equal(
-			(await memory.searchSummaries({ query: "unrelated", topK: 1 }, "vsearch"))[0].text,
+			(await memory.searchSummaries({ query: "unrelated", topK: 1 }, EMBEDDING_RECALL))[0].text,
 			"existing summary",
 		);
 	});
@@ -223,18 +228,18 @@ describe("cross-session memory", () => {
 				return [1, 0];
 			},
 		};
-		memory = new MemoryService(db, provider);
-		const pending = memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, "query");
+		memory = new MemoryService(db, { embedding: provider });
+		const pending = memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, OFFLINE_HYBRID_OPTIONS);
 		await started.promise;
 		assert.equal(queryCalls, 0);
 		release.resolve([[1, 0]]);
 		const hits = await pending;
 		assert.equal(hits[0].sourceId, "session-a");
 		assert.equal(hits[0].location.entryId, "u1");
-		const vectorHits = await memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, "vsearch");
+		const vectorHits = await memory.searchSummaries({ query: "no lexical overlap", topK: 1 }, EMBEDDING_RECALL);
 		assert.deepEqual(hits, [{ ...vectorHits[0], score: 0.75 }]);
 		db.prepare("UPDATE summaries SET content = 'changed'").run();
-		await assert.rejects(memory.searchSummaries({ query: "changed", topK: 1 }, "query"), /incomplete/);
+		await assert.rejects(memory.searchSummaries({ query: "changed", topK: 1 }, OFFLINE_HYBRID_OPTIONS), /incomplete/);
 		assert.equal(queryCalls, 2);
 	});
 
@@ -285,15 +290,15 @@ describe("cross-session memory", () => {
 				async () => text,
 			);
 		}
-		const hits = await memory.searchSummaries({ query: "quasar", topK: 2 });
+		const hits = await memory.searchSummaries({ query: "quasar", topK: 2 }, BM25_RECALL);
 		assert.equal(hits.length, 2);
 		assert.equal(hits[0].sourceId, "session-a");
 		assert.ok(hits.every((hit) => hit.sourceId !== "session-d"));
 		assert.ok(hits[0].score >= hits[1].score);
-		assert.equal((await memory.searchSummaries({ query: "quasar", topK: 1 })).length, 1);
-		assert.deepEqual(await memory.searchSummaries({ query: "absenttoken", topK: 5 }), []);
-		assert.deepEqual(await memory.searchSummaries({ query: "   ", topK: 5 }), []);
-		await assert.doesNotReject(memory.searchSummaries({ query: 'quasar " OR (', topK: 5 }));
+		assert.equal((await memory.searchSummaries({ query: "quasar", topK: 1 }, BM25_RECALL)).length, 1);
+		assert.deepEqual(await memory.searchSummaries({ query: "absenttoken", topK: 5 }, BM25_RECALL), []);
+		assert.deepEqual(await memory.searchSummaries({ query: "   ", topK: 5 }, BM25_RECALL), []);
+		await assert.doesNotReject(memory.searchSummaries({ query: 'quasar " OR (', topK: 5 }, BM25_RECALL));
 	});
 
 	it("keeps the previous summary and checkpoint when an incremental summary fails", async () => {
@@ -306,7 +311,7 @@ describe("cross-session memory", () => {
 		await assert.rejects(memory.syncSession(createSessionSnapshot(entries), summarize), /summary failed/);
 		assert.equal(summarize.mock.callCount(), 1);
 		assert.equal(memory.readMessages("session-a", "NEW_RAW").length, 1);
-		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 });
+		const hits = await memory.searchSummaries({ query: "quasar", topK: 5 }, BM25_RECALL);
 		assert.equal(hits.length, 1);
 		assert.equal(hits[0].text, "quasar previous");
 		assert.equal(hits[0].location.entryId, "u1");
@@ -315,7 +320,10 @@ describe("cross-session memory", () => {
 		await memory.syncSession(createSessionSnapshot(entries), nextSummary);
 		assert.match(nextSummary.mock.calls[0].arguments[0], /quasar previous/);
 		assert.match(nextSummary.mock.calls[0].arguments[0], /NEW_RAW/);
-		assert.equal((await memory.searchSummaries({ query: "recovered", topK: 5 }))[0].location.entryId, "u2");
+		assert.equal(
+			(await memory.searchSummaries({ query: "recovered", topK: 5 }, BM25_RECALL))[0].location.entryId,
+			"u2",
+		);
 	});
 
 	it("retains memory after the database is reopened", async () => {
@@ -326,7 +334,10 @@ describe("cross-session memory", () => {
 		db.close();
 		db = openDatabase(join(directory, "nested", "index.db"));
 		memory = new MemoryService(db);
-		assert.equal((await memory.searchSummaries({ query: "quasar", topK: 5 }))[0].text, "quasar persisted");
+		assert.equal(
+			(await memory.searchSummaries({ query: "quasar", topK: 5 }, BM25_RECALL))[0].text,
+			"quasar persisted",
+		);
 		assert.equal(memory.readMessages("session-a", "quasar").length, 1);
 	});
 });

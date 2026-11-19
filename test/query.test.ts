@@ -1,19 +1,12 @@
 import assert from "node:assert/strict";
 import { it, mock } from "node:test";
-import { BM25EmbeddingRecall } from "../src/search/bm25-embedding-recall.ts";
 import { EmbeddingQueryProcessor } from "../src/search/embedding-query-processor.ts";
+import { ParallelRecall as TaskRecall } from "../src/search/parallel-recall.ts";
 import type { QueryProcessor } from "../src/search/processor.ts";
-import { QueryRecall } from "../src/search/recall.ts";
 import { SearchService } from "../src/search/service.ts";
-import type { RecallTask, RetrievalHit, RetrievalQuery, Retriever } from "../src/search/types.ts";
+import { BM25_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS, EMBEDDING_RECALL } from "../src/search/strategies.ts";
+import type { RetrievalHit, RetrievalQuery, Retriever } from "../src/search/types.ts";
 import { OfflineReranker } from "./helpers/reranking.ts";
-
-class TaskRecall extends QueryRecall {
-	constructor(tasks: RecallTask[]) {
-		super();
-		for (const task of tasks) this.addTask(task);
-	}
-}
 
 function hit(sourceId: string, score = 0.75): RetrievalHit {
 	return { text: sourceId, score, sourceType: "memory", sourceId, location: { sourcePath: `${sourceId}.jsonl` } };
@@ -38,8 +31,9 @@ it("starts every path before completion and processes all results in registratio
 			results.flatMap((result) => result.hits),
 		),
 	} satisfies QueryProcessor;
-	const service = new SearchService({ retrieve: async () => [] }, undefined, { recall, processor });
-	const pending = service.query(request);
+	const service = new SearchService<RetrievalHit>({ sourceType: "memory", bm25: { retrieve: async () => [] } });
+	const selected = { id: "test", createRecall: () => recall, createProcessor: () => processor };
+	const pending = service.retrieve(request, selected);
 	assert.deepEqual(started, ["path-0", "path-1", "path-2"]);
 	gates[2].resolve([hit("third")]);
 	gates[0].resolve([hit("first")]);
@@ -81,10 +75,11 @@ it("drains other paths after synchronous and async failures without invoking the
 		{ path: "slow", run: async () => gate.promise },
 	]);
 	const processor = { process: mock.fn(async () => []) } satisfies QueryProcessor;
-	const service = new SearchService({ retrieve: async () => [] }, undefined, { recall, processor });
+	const service = new SearchService<RetrievalHit>({ sourceType: "memory", bm25: { retrieve: async () => [] } });
+	const selected = { id: "test", createRecall: () => recall, createProcessor: () => processor };
 	let finished = false;
 	const checked = assert.rejects(
-		service.query(request).finally(() => {
+		service.retrieve(request, selected).finally(() => {
 			finished = true;
 		}),
 		(error: unknown) => {
@@ -218,10 +213,10 @@ it("blends by RRF rank at the 3/4 and 10/11 boundaries despite reordered model r
 	const hits = Array.from({ length: 11 }, (_, index) => hit(String(index + 1)));
 	const output = await processor.process({ query: "q", topK: 11 }, [{ path: "embedding", hits }]);
 	const scores = new Map(output.map((result) => [result.sourceId, result.score]));
-	assert.ok(Math.abs(scores.get("3")! - 0.45) < 1e-12);
-	assert.ok(Math.abs(scores.get("4")! - 0.51) < 1e-12);
-	assert.ok(Math.abs(scores.get("10")! - 0.3) < 1e-12);
-	assert.ok(Math.abs(scores.get("11")! - (0.4 / 11 + 0.42)) < 1e-12);
+	assert.ok(Math.abs((scores.get("3") ?? NaN) - 0.45) < 1e-12);
+	assert.ok(Math.abs((scores.get("4") ?? NaN) - 0.51) < 1e-12);
+	assert.ok(Math.abs((scores.get("10") ?? NaN) - 0.3) < 1e-12);
+	assert.ok(Math.abs((scores.get("11") ?? NaN) - (0.4 / 11 + 0.42)) < 1e-12);
 	assert.deepEqual(
 		output.slice(0, 5).map((result) => result.sourceId),
 		["1", "4", "11", "3", "2"],
@@ -249,33 +244,36 @@ it("query recalls both paths once while search and vsearch keep their single-pat
 	const hits = [hit("semantic")];
 	const vector = { retrieve: mock.fn(async () => hits) } satisfies Retriever;
 	const reranker = new OfflineReranker();
-	const service = new SearchService(lexical, vector, {
-		recall: new BM25EmbeddingRecall(lexical, vector),
-		processor: new EmbeddingQueryProcessor(reranker),
-	});
-	assert.deepEqual(await service.query(request), [
+	const service = new SearchService({ sourceType: "memory", bm25: lexical, vector, reranker });
+	const selected = BM25_EMBEDDING_RRF_RERANK_OPTIONS;
+	assert.deepEqual(await service.retrieve(request, selected), [
 		{ ...hit("lexical", 10), score: 0.75 },
 		{ ...hits[0], score: 0.375 },
 	]);
 	assert.equal(lexical.retrieve.mock.callCount(), 1);
 	assert.equal(vector.retrieve.mock.callCount(), 1);
 	assert.equal(reranker.calls.length, 1);
-	await service.search(request);
+	await service.retrieve(request, BM25_RECALL);
 	assert.equal(vector.retrieve.mock.callCount(), 1);
-	await service.vsearch(request);
+	await service.retrieve(request, EMBEDDING_RECALL);
 	assert.equal(lexical.retrieve.mock.callCount(), 2);
-	await assert.rejects(new SearchService(lexical).query(request), /requires vector/);
+	await assert.rejects(
+		new SearchService({ sourceType: "memory", bm25: lexical }).retrieve(request, BM25_EMBEDDING_RRF_RERANK_OPTIONS),
+		/requires an embedding provider/,
+	);
 });
 
 it("propagates processor failure after successful recall", async () => {
 	const cause = new Error("processor failed");
-	const service = new SearchService({ retrieve: async () => [] }, undefined, {
-		recall: new TaskRecall([{ path: "custom", run: async () => [] }]),
-		processor: {
+	const service = new SearchService({ sourceType: "memory", bm25: { retrieve: async () => [] } });
+	const selected = {
+		id: "failure",
+		createRecall: () => new TaskRecall([{ path: "custom", run: async () => [] }]),
+		createProcessor: () => ({
 			process: async () => {
 				throw cause;
 			},
-		},
-	});
-	await assert.rejects(service.query(request), (error: unknown) => error === cause);
+		}),
+	};
+	await assert.rejects(service.retrieve(request, selected), (error: unknown) => error === cause);
 });

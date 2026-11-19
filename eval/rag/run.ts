@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { createEmbeddingProvider } from "../../src/config.ts";
+import { createEmbeddingProvider, createRerankingProvider } from "../../src/config.ts";
 import { isSearchMode } from "../../src/search/modes.ts";
+import { selectRetrievalOptions } from "../../src/search/strategies.ts";
 import { BeirDataset } from "./beir.ts";
 import { runRetrievalEval } from "./runner.ts";
 
@@ -21,17 +22,21 @@ if (!values.dataset || !values.output) {
 		"Usage: node eval/rag/run.ts --dataset <BEIR directory> --output <new directory> [--top-k 10] [--split test] [--mode search|vsearch|query] [--builds <cache root>]",
 	);
 }
-if (!isSearchMode(values.mode)) throw new Error("Mode must be search, vsearch or query.");
-const embedding = values.mode !== "search" ? createEmbeddingProvider() : undefined;
+if (!isSearchMode(values.mode)) throw new Error(`Mode ${values.mode} doesn't Exist.`);
+const retrieval = selectRetrievalOptions(values.mode);
+const embedding = retrieval.requiresEmbedding ? createEmbeddingProvider() : undefined;
+const reranking = createRerankingProvider();
 try {
 	await runRetrievalEval({
 		loader: new BeirDataset(values.dataset, values.split),
 		output: values.output,
 		builds: values.builds,
 		topK: Number(values["top-k"]),
-		mode: values.mode,
+		retrieval,
 		embedding,
+		reranking,
 	});
 } finally {
 	await embedding?.close();
+	await reranking?.close();
 }

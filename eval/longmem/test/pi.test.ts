@@ -7,14 +7,14 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall, InMemoryCredentialS
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { EmbeddingProvider } from "../../../src/embedding/provider.ts";
 import { VectorIndex } from "../../../src/embedding/vector-index.ts";
+import { BM25_RECALL } from "../../../src/search/strategies.ts";
 import { openDatabase } from "../../../src/storage/db.ts";
-import { mockReranking } from "../../../test/helpers/reranking.ts";
+import { OFFLINE_HYBRID_OPTIONS } from "../../../test/helpers/reranking.ts";
 import { closeEvaluationSession, createEvaluationSession, runQuestion } from "../pi.ts";
 import type { TraceEvent } from "../types.ts";
 
-for (const retrieval of ["search", "query"] as const) {
-	it(`runs the real Pi SDK with fixed ${retrieval} retrieval and only memory tools`, async (context) => {
-		mockReranking(context.mock);
+for (const retrieval of ["search", "query", "custom-lexical"] as const) {
+	it(`runs the real Pi SDK with fixed ${retrieval} retrieval and only memory tools`, async () => {
 		const root = await mkdtemp(join(tmpdir(), "batmem-sdk-"));
 		let queryCalls = 0;
 		let documentCalls = 0;
@@ -62,7 +62,13 @@ for (const retrieval of ["search", "query"] as const) {
 			assert.ok(model);
 			faux.setResponses([
 				fauxAssistantMessage(
-					[fauxToolCall("memory_search", { query: "pet", topK: 1, mode: retrieval === "query" ? "search" : "query" })],
+					[
+						fauxToolCall("memory_search", {
+							query: "pet",
+							topK: 1,
+							strategy: retrieval === "query" ? "search" : "query",
+						}),
+					],
 					{
 						stopReason: "toolUse",
 					},
@@ -80,11 +86,18 @@ for (const retrieval of ["search", "query"] as const) {
 					agentDirectory: join(root, "agent"),
 					sessionDirectory: join(root, "sessions"),
 				},
-				retrieval,
+				retrieval === "query" ? OFFLINE_HYBRID_OPTIONS : { ...BM25_RECALL, id: retrieval },
 				retrieval === "query" ? embedding : null,
+				null,
 			);
 			try {
 				assert.deepEqual(session.getActiveToolNames().sort(), ["memory_read", "memory_search"]);
+				const command = session.extensionRunner.getCommand("memory-strategy");
+				assert.ok(command);
+				await assert.rejects(
+					command.handler("search", session.extensionRunner.createCommandContext()),
+					/strategy is fixed/,
+				);
 				const result = await runQuestion(session, "What is my pet?", "2023/05/30 (Tue) 23:40");
 				assert.equal(result.text, "cat");
 				assert.ok(

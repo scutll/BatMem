@@ -14,15 +14,28 @@ import {
 import { closeEvaluationSession } from "../eval/longmem/pi.ts";
 import type { EmbeddingProvider } from "../src/embedding/provider.ts";
 import registerBatMem from "../src/index.ts";
+import { ParallelRecall } from "../src/search/parallel-recall.ts";
+import { PassthroughProcessor } from "../src/search/passthrough-processor.ts";
+import type { RetrievalOptions } from "../src/search/types.ts";
 import { openDatabase } from "../src/storage/db.ts";
-import { mockReranking } from "./helpers/reranking.ts";
+import { OFFLINE_HYBRID_OPTIONS } from "./helpers/reranking.ts";
 
 for (const enabled of [true, false]) {
-	it(`ordinary memory/document tools support query with embeddings ${enabled ? "enabled" : "disabled"}`, async (context) => {
-		mockReranking(context.mock);
+	it(`ordinary memory/document tools support query with embeddings ${enabled ? "enabled" : "disabled"}`, async () => {
 		const root = await mkdtemp(join(tmpdir(), "batmem-extension-"));
 		let closed = 0;
 		const queries: string[] = [];
+		const expanded: RetrievalOptions = {
+			id: "expanded",
+			createRecall: ({ bm25 }) =>
+				new ParallelRecall([
+					{
+						path: "expanded-bm25",
+						run: async (request) => bm25.retrieve({ ...request, query: "known" }),
+					},
+				]),
+			createProcessor: () => new PassthroughProcessor(),
+		};
 		const embedding: EmbeddingProvider & { close(): Promise<void> } = {
 			identity: "test/extension:v1",
 			dimensions: 2,
@@ -75,7 +88,14 @@ for (const enabled of [true, false]) {
 				noPromptTemplates: true,
 				noThemes: true,
 				noContextFiles: true,
-				extensionFactories: [(pi) => registerBatMem(pi, { embedding: enabled ? embedding : null })],
+				extensionFactories: [
+					(pi) =>
+						registerBatMem(pi, {
+							embedding: enabled ? embedding : null,
+							reranking: null,
+							retrieval: { strategies: { query: OFFLINE_HYBRID_OPTIONS, expanded } },
+						}),
+				],
 			});
 			await loader.reload();
 			const { session, extensionsResult } = await createAgentSession({
@@ -102,7 +122,7 @@ for (const enabled of [true, false]) {
 					const execute = () =>
 						tool.execute(
 							"offline-call",
-							{ query: "unrelated", topK: 1, mode: "query" },
+							{ query: "unrelated", topK: 1, strategy: "query" },
 							undefined,
 							undefined,
 							session.extensionRunner.createToolContext("offline-call", undefined),
@@ -120,10 +140,10 @@ for (const enabled of [true, false]) {
 							assert.equal(hits[0].location.startLine, 1);
 						} else assert.equal(hits[0].location.entryId, "entry");
 					} else {
-						await assert.rejects(execute(), /requires vector/);
+						await assert.rejects(execute(), /requires an embedding provider/);
 						const result = await tool.execute(
 							"lexical",
-							{ query: "known", mode: "search" },
+							{ query: "known", strategy: "search" },
 							undefined,
 							undefined,
 							session.extensionRunner.createToolContext("lexical", undefined),
@@ -132,6 +152,41 @@ for (const enabled of [true, false]) {
 					}
 				}
 				assert.deepEqual(errors, []);
+				const command = session.extensionRunner.getCommand("memory-strategy");
+				assert.ok(command);
+				const commandContext = session.extensionRunner.createCommandContext();
+				await command.handler("expanded", commandContext);
+				await assert.rejects(command.handler("missing", commandContext), /Unknown retrieval strategy/);
+				for (const name of ["memory_search", "rag_search"]) {
+					const tool = session.extensionRunner.getToolDefinition(name);
+					assert.ok(tool);
+					const ctx = session.extensionRunner.createToolContext("switch", undefined);
+					const result = await tool.execute("switch", { query: "unrelated" }, undefined, undefined, ctx);
+					assert.ok(JSON.stringify(result).includes("known"));
+					const override = await tool.execute(
+						"override",
+						{ query: "unrelated", strategy: "search" },
+						undefined,
+						undefined,
+						ctx,
+					);
+					assert.deepEqual(override.details, []);
+					await assert.rejects(
+						tool.execute("unknown", { query: "known", strategy: "missing" }, undefined, undefined, ctx),
+						/Unknown retrieval strategy/,
+					);
+				}
+				await session.extensionRunner.emitBeforeAgentStart(
+					{ messageType: "user", prompt: "unrelated" },
+					{ cwd: project },
+				);
+				assert.ok(JSON.stringify(await session.extensionRunner.emitContext([])).includes("known summary evidence"));
+				await command.handler("search", commandContext);
+				await session.extensionRunner.emitBeforeAgentStart(
+					{ messageType: "user", prompt: "unrelated" },
+					{ cwd: project },
+				);
+				assert.deepEqual(await session.extensionRunner.emitContext([]), []);
 			} finally {
 				await closeEvaluationSession(session);
 			}

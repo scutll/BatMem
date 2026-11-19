@@ -1,7 +1,6 @@
+import type { RerankingProvider } from "../reranking/provider.ts";
 import type { QueryProcessor } from "./processor.ts";
 import type { QueryRecall } from "./recall.ts";
-
-export type SearchMode = "search" | "vsearch" | "query";
 
 /** Shared search contract for session summaries and document chunks. */
 export interface RetrievalQuery {
@@ -48,7 +47,35 @@ export interface RecallResult<T extends RetrievalHit = RetrievalHit> {
 	hits: T[];
 }
 
-export interface QueryPipeline<T extends RetrievalHit = RetrievalHit> {
-	recall: QueryRecall<T>;
-	processor: QueryProcessor<T>;
+/** Source-bound dependencies live as long as the index connection. Factories borrow them. */
+export interface RetrievalDependencies<T extends RetrievalHit = RetrievalHit> {
+	readonly sourceType: RetrievalHit["sourceType"];
+	readonly bm25: Retriever<T>;
+	readonly vector?: Retriever<T>;
+	readonly reranker?: RerankingProvider;
+}
+
+/** Serializable experiment description supplied alongside the actual factories. */
+export interface RetrievalMetadata {
+	readonly recallPaths: readonly string[];
+	readonly processor: string;
+	readonly score: string;
+}
+
+/** One strategy; factories create request-local execution objects. */
+export interface RetrievalOptions<T extends RetrievalHit = RetrievalHit> {
+	readonly id: string;
+	readonly requiresEmbedding?: boolean;
+	readonly metadata?: RetrievalMetadata;
+	readonly createRecall: (deps: RetrievalDependencies<T>) => QueryRecall<T>;
+	readonly createProcessor: (deps: RetrievalDependencies<T>) => QueryProcessor<T>;
+}
+
+export interface RetrievalService<T extends RetrievalHit = RetrievalHit> {
+	retrieve(request: RetrievalQuery, options: RetrievalOptions<T>): Promise<T[]>;
+}
+
+export interface RetrievalConfiguration {
+	readonly defaultStrategy?: string;
+	readonly strategies?: Readonly<Record<string, RetrievalOptions>>;
 }

@@ -1,36 +1,28 @@
-import { BM25EmbeddingRecall } from "./bm25-embedding-recall.ts";
-import { EmbeddingQueryProcessor } from "./embedding-query-processor.ts";
-import type { QueryPipeline, RetrievalHit, RetrievalQuery, Retriever } from "./types.ts";
+import type {
+	RetrievalDependencies,
+	RetrievalHit,
+	RetrievalOptions,
+	RetrievalQuery,
+	RetrievalService,
+} from "./types.ts";
 
-/** Stable public search entry points. Strategy selection is explicit; vector errors never become BM25 results. */
-export class SearchService<T extends RetrievalHit = RetrievalHit> {
-	private readonly bm25: Retriever<T>;
-	private readonly vector?: Retriever<T>;
-	private readonly pipeline?: QueryPipeline<T>;
+/** Execute the caller's strategy without choosing algorithms or allocating provider connections. */
+export class SearchService<T extends RetrievalHit = RetrievalHit> implements RetrievalService<T> {
+	private readonly dependencies: RetrievalDependencies<T>;
 
-	constructor(bm25: Retriever<T>, vector?: Retriever<T>, pipeline?: QueryPipeline<T>) {
-		this.bm25 = bm25;
-		this.vector = vector;
-		this.pipeline =
-			pipeline ??
-			(vector
-				? { recall: new BM25EmbeddingRecall(bm25, vector), processor: new EmbeddingQueryProcessor<T>() }
-				: undefined);
+	constructor(dependencies: RetrievalDependencies<T>) {
+		this.dependencies = { ...dependencies };
 	}
 
-	search(request: RetrievalQuery): Promise<T[]> {
-		return this.bm25.retrieve(request);
-	}
-
-	async vsearch(request: RetrievalQuery): Promise<T[]> {
-		if (!this.vector) throw new Error("Vector search is not configured.");
-		return this.vector.retrieve(request);
-	}
-
-	async query(request: RetrievalQuery): Promise<T[]> {
-		if (!this.pipeline) throw new Error("Query search is not configured; the default pipeline requires vector search.");
+	async retrieve(request: RetrievalQuery, options: RetrievalOptions<T>): Promise<T[]> {
+		if (!Number.isSafeInteger(request.topK) || request.topK < 1) return [];
+		if (options.requiresEmbedding && !this.dependencies.vector)
+			throw new Error(`Strategy ${options.id} requires an embedding provider and vector retriever.`);
 		const original = { ...request };
-		const results = await this.pipeline.recall.recall(original);
-		return this.pipeline.processor.process(original, results);
+		// Resolve factories before awaiting so strategy changes cannot affect this invocation.
+		const recall = options.createRecall(this.dependencies);
+		const processor = options.createProcessor(this.dependencies);
+		const results = await recall.recall({ ...original });
+		return (await processor.process(original, results)).slice(0, original.topK);
 	}
 }

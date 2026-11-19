@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { EmbeddingProvider } from "../../src/embedding/provider.ts";
-import type { RetrievalHit, RetrievalQuery, SearchMode } from "../../src/search/types.ts";
+import type { RerankingProvider } from "../../src/reranking/provider.ts";
+import type { RetrievalHit, RetrievalOptions, RetrievalQuery } from "../../src/search/types.ts";
 import type { DatasetLoader } from "./dataset.ts";
 
 export interface CorpusBuild {
@@ -21,8 +22,9 @@ export interface RetrievalEvalOptions {
 	/** Shared build root. Omit for an isolated database inside output (e.g. in-memory adapter tests). */
 	builds?: string;
 	topK?: number;
-	mode?: SearchMode;
+	retrieval: RetrievalOptions;
 	embedding?: EmbeddingProvider;
+	reranking?: RerankingProvider;
 }
 
 /** Export consumes ordered hits only; dataset formats and retrieval strategies stay outside this contract. */

@@ -14,7 +14,7 @@ BatMem 采用两层评测：**RAG Retrieval Eval** 检查共享检索模块的�
 | --- | --- |
 | `MemoryService` | `sessions` 保存会话来源，`messages` 保存消息文本，`summaries` 为每个会话保存一条当前摘要及处理位置 |
 | `RAGService` | 扫描 Markdown，以内容哈希判断变更，将文档和切块保存到 `documents / chunks` |
-| `SearchService` | 提供异步 `search()`、`vsearch()` 和 `query()`；query 并发召回后调用 Processor |
+| `SearchService` | 统一执行 `retrieve(request, options)`，按 Options 创建 Recall 和 Processor |
 | `VectorIndex` | 分批生成缺失向量，写入 `embeddings`；`embedding_config` 保存数据库当前使用的编码配置 |
 | `openDatabase()` | 初始化表、FTS5 全文索引及触发器；启用外键、WAL 和 5 秒锁等待 |
 
@@ -30,7 +30,7 @@ session_start
   → 配置了 embedding 时，补建文档块向量
 
 before_agent_start（用户输入）
-  → memorySearch.search({ query: prompt, topK: 1 }) → 本轮候选摘要
+  → memory.searchSummaries({ query: prompt, topK: 1 }, selectedOptions) → 本轮候选摘要
 context（每次模型请求）
   → 将候选摘要作为参考消息追加到请求上下文
 
@@ -47,33 +47,27 @@ session_shutdown
 
 例如，上一轮已处理到消息 B，本轮新增 C、D，摘要输入就是“旧摘要 + C、D”；成功后处理位置推进到 D。摘要更新由扩展串行执行，避免旧任务覆盖新结果。
 
-启动时的文档扫描和摘要向量补建作为后台任务发起，自动注入默认使用 BM25 Top-1，可通过扩展的 memorySearchMode 改为 vsearch/query。搜索范围包含本会话摘要，且没有相关性阈值。同一轮模型请求复用该候选；自动追加的证据仅存在于请求上下文。Agent 还可主动调用工具：
+启动时的文档扫描和摘要向量补建作为后台任务发起，自动注入默认使用 BM25 Top-1，通过 `retrieval.defaultStrategy` 配置初始策略，运行时用 `/memory-strategy` 切换。搜索范围包含本会话摘要，且没有相关性阈值。同一轮模型请求复用该候选；自动追加的证据仅存在于请求上下文。Agent 还可主动调用工具：
 
 | 工具 | 当前行为 |
 | --- | --- |
-| `memory_search(query, topK?, mode?)` | 等待摘要同步，搜索会话摘要；默认 `topK = 5`、`mode = search`，工具允许 Top-K 为 1–100 |
+| `memory_search(query, topK?, strategy?)` | 等待摘要同步，搜索会话摘要；默认 `topK = 5`、初始策略为 `search`，工具允许 Top-K 为 1–100 |
 | `memory_read(sessionId, keyword)` | 在指定会话中按区分大小写的字面子串匹配，返回最新三条 user/assistant 消息；同时间按插入顺序倒序，空关键词返回空数组 |
-| `rag_search(query, topK?, mode?)` | 等待文档扫描，搜索文档块；默认值与 `memory_search` 相同，结果带原文件路径和行号 |
+| `rag_search(query, topK?, strategy?)` | 等待文档扫描，搜索文档块；默认值与 `memory_search` 相同，结果带原文件路径和行号 |
 
 文档在 `session_start` 递归扫描 `.md` 文件。每个变更文件单独提交完整切块替换；切块上限为 500 个 UTF-16 代码单元，相邻块重叠 100，保留行号和当前标题。扫描全部成功后清理已删除文件的索引。
 
 ### 共享搜索路径
 
 ```text
-memory_search / rag_search / RAG 评测
-  → SearchService
-    ├─ search() → BM25Retriever → summaries_fts / chunks_fts
-    └─ vsearch() → VectorRetriever
-                   → VectorIndex.assertReady() → embedQuery()
-                   → 再次检查完整性 → VectorIndex.search()
-  → rowToHit() → RetrievalHit[]
+Extension / Eval 选择 RetrievalOptions
+  → MemoryService / 文档工具传递 Options
+  → SearchService.retrieve(request, options)
+  → createRecall(deps) / createProcessor(deps)
+  → RecallResult[] → Processor → RetrievalHit[]
 ```
 
-`search()` 从查询中提取字母、数字和下划线组成的词，逐词加引号并用 `OR` 连接，交给 SQLite FTS5 的默认分词器匹配。结果按取负后的 BM25 分数降序排列。
-
-`vsearch()` 将原始查询编码为向量，通过 sqlite-vec 对指定来源的已存向量做精确余弦距离扫描，以 `1 - distance` 作为分数降序排列。两条路径都返回文本、分数、来源 ID 和定位信息；不同算法的分数各自用于排序。
-
-`query()` 使用 `BM25EmbeddingRecall` 并发执行两路异步任务，各路收到独立的请求对象；`QueryRecall` 抽象类支持继续注册其他路径。所有任务结束后，成功结果以 `{ path, hits }[]` 交给 `QueryProcessor`。任一路失败则等待全部结束后报错，不执行 Processor。当前 `EmbeddingQueryProcessor` 原样返回 embedding hits，不融合或重排，因此相同配置下 query 与 vsearch 的排名、分数相同。每路 Top-K 沿用搜索请求，输出仍为 `RetrievalHit[]`。
+内置 `search` 使用 BM25，`vsearch` 使用向量，两者均经单路召回和透传 Processor；`query` 使用双路召回、RRF 融合、Jina 重排和混合评分。`ParallelRecall` 为每路提供请求副本，全部结束后按声明顺序汇总；路径可在 `run()` 中改写查询和处理结果。失败时等待全部任务结束并报告错误。算法和评分详见 [Memories.md](Memories.md#检索编排与混合评分)。
 
 默认 embedding 配置为 Jina `jina-embeddings-v3`、1024 维、归一化向量；摘要和文档块使用 `retrieval.passage`，查询使用 `retrieval.query`，输入保持完整。配置读取 BatMem 根目录 `.env`，同名文件值优先于进程环境；`JINA_API_KEY` 启用向量能力，`HTTPS_PROXY / HTTP_PROXY` 配置其代理。
 
@@ -92,7 +86,7 @@ BEIR → DatasetLoader → 构建或复用索引 → search / vsearch / query
 
 ### 检索方式选择
 
-CLI 参数为 `--mode search|vsearch|query`，PowerShell 对应 `-Mode`，默认 `search`。`search` 使用文本与 FTS 索引；`vsearch` 和 `query` 先补齐整个语料的文档向量，再逐条编码查询。运行清单的 `retriever` 记录所用方式。query 额外记录 `queryPipeline`，包含召回路径和 `embedding-passthrough` Processor；输出分数仍是余弦相似度。新增 Recall/Processor 源码纳入运行代码哈希，不改变语料 build 指纹或评分流程。
+CLI 的 `--mode` 和 PowerShell 的 `-Mode` 在入口选择 `strategies.ts` 中的 Options，默认 `search`。程序调用 `runRetrievalEval()` 时直接传入 `retrieval: selectedOptions`，以及借用的 embedding、reranking provider。是否补建向量由 Options 的 `requiresEmbedding` 决定。运行清单从 ID 和 metadata 记录检索方式、召回路径、Processor 与分数含义，相关源码纳入审计哈希；策略变化不改变语料 build 指纹。
 
 ### 当前构建缓存与恢复
 
@@ -216,7 +210,7 @@ Judge 通过 `question_id` 对齐已保存回答与参考答案；评分前校�
 
 `build` 校验历史文件哈希，通过 `loadSessionSnapshot()` 加载历史，每个完整会话调用一次 `syncSession()`，以 `session-final` 方式生成一条摘要。每题全部摘要完成、数据库关闭后发布 `memory-ready.json`。若选择 `vsearch` 或 `query`，同一阶段再检查已有摘要向量并补建缺失部分；向量调用失败时，已完成摘要和向量批次留在 build 中，重跑 build 继续补建。回答前再次检查向量是否完整。
 
-`answer` 将该题 build 数据库复制到 run 内，以 run 的 `project` 为 cwd，通过 `createEvaluationSession()` 以 `evalMode` 加载真实扩展，使用 Pi 默认系统 Prompt。扩展入口跳过问答同步、向量补建和文档扫描；Agent 仍可在副本上搜索历史摘要并读取消息。`memory_search` 在评测中固定使用 run 的检索模式，即使模型传入另一种 `mode`。新 Session 和 Agent 状态也写在 run 内，`runQuestion()` 保存最后一条正常完成的 assistant 文本。build 阶段会按导入的历史 Session ID 清理旧评测遗留的问答索引，answer 阶段在副本上再次检查历史 Session 和摘要完整性。
+`answer` 将该题 build 数据库复制到 run 内，以 run 的 `project` 为 cwd，通过 `createEvaluationSession()` 以 `evalMode` 加载真实扩展，使用 Pi 默认系统 Prompt。扩展入口跳过问答同步、向量补建和文档扫描；Agent 仍可在副本上搜索历史摘要并读取消息。`memory_search` 在评测中固定使用 run 的检索模式，工具传入的 `strategy` 不覆盖该选择。新 Session 和 Agent 状态也写在 run 内，`runQuestion()` 保存最后一条正常完成的 assistant 文本。build 阶段会按导入的历史 Session ID 清理旧评测遗留的问答索引，answer 阶段在副本上再次检查历史 Session 和摘要完整性。
 
 `judge` 读取 `answers-<mode>.jsonl` 与 build 中的参考答案，保存逐题判定，再汇总指标。问答中的单题失败会被记录，整批有失败时禁止进入评分。
 

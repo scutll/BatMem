@@ -1,4 +1,13 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { EmbeddingProvider } from "../embedding/provider.ts";
+import type { RetrievalService } from "../search/types.ts";
+
+export interface MemoryServiceOptions {
+	embedding?: EmbeddingProvider;
+	search?: RetrievalService;
+	/** Evaluation reads existing vectors without startup writes. Default: true. */
+	backfill?: boolean;
+}
 
 /** Captured SessionManager data for one complete, append-only conversation. No branch selection occurs. */
 export interface SessionSnapshot {

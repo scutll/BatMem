@@ -3,15 +3,11 @@ import { createReadStream } from "node:fs";
 import { mkdir, open, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { VectorIndex } from "../../src/embedding/vector-index.ts";
-import { BM25Retriever } from "../../src/search/bm25.ts";
-import { isSearchMode } from "../../src/search/modes.ts";
-import { SearchService } from "../../src/search/service.ts";
-import { VectorRetriever } from "../../src/search/vector.ts";
+import { createSearchService } from "../../src/search/create-service.ts";
 import { fingerprintCorpus, prepareCorpusBuild } from "./build.ts";
 import type { EvaluationQuery } from "./dataset.ts";
 import { Progress } from "./progress.ts";
 import type { RetrievalEvalOptions, RetrievalFunction } from "./types.ts";
-import { stripTypeScriptTypes } from "node:module";
 
 export { indexCorpus } from "./build.ts";
 
@@ -31,7 +27,6 @@ export async function exportResults(
 
 			while (true) {
 				try {
-
 					// In case of some short Network Error Breaks the whole Eval,
 					// continuously runs the retrieve until the network recovers
 					const hits = await retrieve({ query: query.text, topK });
@@ -54,7 +49,6 @@ export async function exportResults(
 					break;
 				} catch (error) {
 					progress.update(`${completed + 1}/${queries.length} 检索错误,正在重试: ${error}`);
-					continue;
 				}
 			}
 		}
@@ -71,13 +65,14 @@ export async function exportResults(
  */
 export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<void> {
 	const topK = options.topK ?? 10;
-	const mode = options.mode ?? "search";
-	if (!isSearchMode(mode)) throw new Error("Unknown retrieval mode.");
-	if (mode !== "search" && !options.embedding) throw new Error(`${mode} requires an embedding provider.`);
+	const selected = options.retrieval;
+	const embedding = options.embedding;
+	if (selected.requiresEmbedding && !options.embedding)
+		throw new Error(`${selected.id} requires an embedding provider.`);
 	const loader = options.loader;
 	if (!Number.isSafeInteger(topK) || topK < 1) throw new Error("topK must be a positive integer.");
 	const output = resolve(options.output);
-	console.info(`[评测] 模式：${mode}；Top-K：${topK}；输出：${output}`);
+	console.info(`[评测] 策略：${selected.id}；Top-K：${topK}；输出：${output}`);
 	console.info("[查询集] 读取 Query / Qrels");
 	const queries = await loader.loadQueries();
 	if (!queries.length) throw new Error("No evaluation queries.");
@@ -99,9 +94,9 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 				if (!hasDocument.get(id)) throw new Error(`Qrel references missing corpus ID: ${id}`);
 			}
 		}
-		const vectors = mode !== "search" && options.embedding ? new VectorIndex(db, options.embedding) : undefined;
-		if (vectors) {
-			console.info(`[Embedding 模型] ${options.embedding!.identity}`);
+		const vectors = selected.requiresEmbedding && embedding ? new VectorIndex(db, embedding) : undefined;
+		if (vectors && embedding) {
+			console.info(`[Embedding 模型] ${embedding.identity}`);
 			vectors.initialize();
 			const status = vectors.getStatus("document");
 			console.info(`[向量索引] 已有 ${status.indexed}/${status.total}；待生成 ${status.pending}`);
@@ -117,7 +112,7 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 					progress.finish(`${current.indexed}/${current.total} 已保存；剩余 ${current.pending}`);
 				}
 			} else console.info("[向量索引] 完整复用，无需调用文档 embedding 模型");
-			vectors.assertReady("document", options.embedding!);
+			vectors.assertReady("document", embedding);
 			await writeFile(
 				join(buildDirectory, "build-manifest.json"),
 				JSON.stringify(
@@ -126,7 +121,7 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 						corpus_fingerprint: build.fingerprint,
 						corpus_count: build.count,
 						index_path: build.path,
-						embedding: { identity: options.embedding!.identity, dimensions: options.embedding!.dimensions },
+						embedding: { identity: embedding.identity, dimensions: embedding.dimensions },
 						vector_status: vectors.getStatus("document"),
 					},
 					null,
@@ -134,11 +129,13 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 				),
 			);
 		}
-		const search = new SearchService(
-			new BM25Retriever(db, "document"),
-			vectors && options.embedding ? new VectorRetriever(vectors, options.embedding, "document") : undefined,
+		const search = createSearchService(db, "document", options.embedding, options.reranking);
+		await exportResults(
+			(request) => search.retrieve(request, selected),
+			queries,
+			topK,
+			join(output, "retrieval.jsonl"),
 		);
-		await exportResults(search[mode].bind(search), queries, topK, join(output, "retrieval.jsonl"));
 		const hashes: Record<string, string> = {};
 		for (const path of loader.sourceFiles) {
 			const hash = createHash("sha256");
@@ -160,6 +157,13 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 			"../../src/search/bm25.ts",
 			"../../src/search/vector.ts",
 			"../../src/search/service.ts",
+			"../../src/search/create-service.ts",
+			"../../src/search/strategies.ts",
+			"../../src/search/parallel-recall.ts",
+			"../../src/search/passthrough-processor.ts",
+			"../../src/reranking/provider.ts",
+			"../../src/reranking/jina.ts",
+			"../../src/reranking/types.ts",
 			"../../src/search/recall.ts",
 			"../../src/search/processor.ts",
 			"../../src/search/bm25-embedding-recall.ts",
@@ -198,18 +202,14 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 					implementation_sha256: implementationHashes,
 					node_version: process.version,
 					sqlite_version: db.prepare("SELECT sqlite_version() AS version").get()?.version,
-					retriever: mode,
-					queryPipeline:
-						mode === "query" ? { recallPaths: ["bm25", "embedding"], processor: "rrf-rerank-blend" } : undefined,
-					score:
-						mode === "search"
-							? "negated SQLite BM25; descending"
-							: mode === "query"
-								? "weighted reciprocal RRF rank and rerank score; descending"
-							: "cosine similarity; descending",
-					embedding: vectors
-						? { identity: options.embedding!.identity, dimensions: options.embedding!.dimensions }
+					retriever: selected.id,
+					queryPipeline: selected.metadata
+						? { recallPaths: selected.metadata.recallPaths, processor: selected.metadata.processor }
 						: undefined,
+					score: selected.metadata?.score,
+					reranking: options.reranking?.identity,
+					embedding:
+						vectors && embedding ? { identity: embedding.identity, dimensions: embedding.dimensions } : undefined,
 					vector_status: vectors?.getStatus("document"),
 					indexing: loader.indexing,
 				},

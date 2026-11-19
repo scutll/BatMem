@@ -7,19 +7,15 @@ import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import type { EmbeddingProvider } from "../src/embedding/provider.ts";
 import { VectorIndex } from "../src/embedding/vector-index.ts";
 import { BM25Retriever } from "../src/search/bm25.ts";
-import { BM25EmbeddingRecall } from "../src/search/bm25-embedding-recall.ts";
-import { EmbeddingQueryProcessor } from "../src/search/embedding-query-processor.ts";
 import { SearchService } from "../src/search/service.ts";
+import { BM25_RECALL, BM25_EMBEDDING_RRF_RERANK_OPTIONS, EMBEDDING_RECALL } from "../src/search/strategies.ts";
 import type { RetrievalHit, Retriever } from "../src/search/types.ts";
 import { VectorRetriever } from "../src/search/vector.ts";
 import { openDatabase } from "../src/storage/db.ts";
 import { OfflineReranker } from "./helpers/reranking.ts";
 
 function createSearchService(bm25: Retriever, vector: Retriever): SearchService {
-	return new SearchService(bm25, vector, {
-		recall: new BM25EmbeddingRecall(bm25, vector),
-		processor: new EmbeddingQueryProcessor(new OfflineReranker()),
-	});
+	return new SearchService({ sourceType: "memory", bm25, vector, reranker: new OfflineReranker() });
 }
 
 function hit(sourceId: string, score: number): RetrievalHit {
@@ -111,8 +107,8 @@ describe("search services", () => {
 		const service = createSearchService(lexical, vector);
 		const request = { query: "question", topK: 5 };
 
-		assert.deepEqual(await service.search(request), lexicalHits);
-		assert.deepEqual(await service.vsearch(request), vectorHits);
+		assert.deepEqual(await service.retrieve(request, BM25_RECALL), lexicalHits);
+		assert.deepEqual(await service.retrieve(request, EMBEDDING_RECALL), vectorHits);
 		assert.equal(lexical.retrieve.mock.callCount(), 1);
 		assert.equal(vector.retrieve.mock.callCount(), 1);
 		assert.deepEqual(lexical.retrieve.mock.calls[0].arguments[0], request);
@@ -179,11 +175,12 @@ describe("search services", () => {
 		);
 		assert.equal(queryCalls, 0);
 		await assert.rejects(
-			createSearchService(new BM25Retriever(db, "document"), new VectorRetriever(index, provider, "document")).query(
+			createSearchService(new BM25Retriever(db, "document"), new VectorRetriever(index, provider, "document")).retrieve(
 				{
 					query: "meaning",
 					topK: 1,
 				},
+				BM25_EMBEDDING_RRF_RERANK_OPTIONS,
 			),
 			/incomplete/i,
 		);
@@ -214,11 +211,11 @@ describe("search services", () => {
 		);
 		const request = { query: "quasar", topK: 2 };
 		assert.deepEqual(
-			(await service.search(request)).map((hit) => hit.location.chunkIndex),
+			(await service.retrieve(request, BM25_RECALL)).map((hit) => hit.location.chunkIndex),
 			[0],
 		);
-		const hits = await service.query(request);
-		const vectorHits = await service.vsearch(request);
+		const hits = await service.retrieve(request, BM25_EMBEDDING_RRF_RERANK_OPTIONS);
+		const vectorHits = await service.retrieve(request, EMBEDDING_RECALL);
 		assert.deepEqual(hits, [
 			{ ...vectorHits[1], score: 0.75 },
 			{ ...vectorHits[0], score: 0.375 },
@@ -230,8 +227,8 @@ describe("search services", () => {
 		assert.equal(hits[0].location.startLine, 1);
 		assert.equal(hits[0].location.section, "First");
 		assert.deepEqual(queries, ["quasar", "quasar"]);
-		assert.deepEqual(await service.query({ query: " ", topK: 2 }), []);
-		assert.deepEqual(await service.query({ query: "quasar", topK: 0 }), []);
+		assert.deepEqual(await service.retrieve({ query: " ", topK: 2 }, BM25_EMBEDDING_RRF_RERANK_OPTIONS), []);
+		assert.deepEqual(await service.retrieve({ query: "quasar", topK: 0 }, BM25_EMBEDDING_RRF_RERANK_OPTIONS), []);
 		assert.equal(queries.length, 2);
 	});
 
@@ -245,7 +242,7 @@ describe("search services", () => {
 			},
 		};
 		const service = createSearchService(lexical, vector);
-		await assert.rejects(service.vsearch({ query: "question", topK: 5 }), /not ready/);
+		await assert.rejects(service.retrieve({ query: "question", topK: 5 }, EMBEDDING_RECALL), /not ready/);
 		assert.equal(lexical.retrieve.mock.callCount(), 0);
 	});
 
@@ -253,8 +250,11 @@ describe("search services", () => {
 		const lexical = {
 			retrieve: mock.fn(async (_request: { query: string; topK: number }) => [hit("lexical", 2)]),
 		} satisfies Retriever;
-		const service = new SearchService(lexical);
-		assert.equal((await service.search({ query: "question", topK: 5 }))[0].sourceId, "lexical");
-		await assert.rejects(service.vsearch({ query: "question", topK: 5 }), /embedding|vector|configured/i);
+		const service = new SearchService({ sourceType: "memory", bm25: lexical });
+		assert.equal((await service.retrieve({ query: "question", topK: 5 }, BM25_RECALL))[0].sourceId, "lexical");
+		await assert.rejects(
+			service.retrieve({ query: "question", topK: 5 }, EMBEDDING_RECALL),
+			/embedding|vector|configured/i,
+		);
 	});
 });

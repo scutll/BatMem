@@ -1,17 +1,17 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../../src/storage/database.ts";
 import type { EmbeddingProvider } from "../../../src/models/embedding/provider.ts";
 import type { RerankingProvider } from "../../../src/models/reranking/provider.ts";
 import type { RetrievalHit, RetrievalOptions, RetrievalQuery } from "../../../src/retrieval/core/types.ts";
 import type { DatasetLoader } from "../datasets/types.ts";
 
 export interface CorpusBuild {
-	db: DatabaseSync;
+	db: Database;
 	path: string;
 	fingerprint: string;
 	count: number;
 	reused: boolean;
 	/** Release both the content connection and its process-owned build lock. */
-	close(): void;
+	close(): Promise<void>;
 }
 
 /** One corpus row becomes one indexed chunk. No Markdown scanning or chunking is performed. */

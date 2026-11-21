@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../../src/storage/database.ts";
 import { RAGService } from "../../../src/documents/service.ts";
 import { openDatabase } from "../../../src/storage/database.ts";
 import type { CorpusRecord, DatasetLoader } from "../datasets/types.ts";
@@ -80,7 +81,7 @@ export async function prepareCorpusBuild(
 ): Promise<CorpusBuild> {
 	await mkdir(directory, { recursive: true });
 	const lock = new DatabaseSync(join(directory, "build-lock.db"));
-	let db: DatabaseSync | undefined;
+	let db: Database | undefined;
 	try {
 		try {
 			lock.exec("BEGIN IMMEDIATE");
@@ -128,9 +129,9 @@ export async function prepareCorpusBuild(
 			fingerprint,
 			count,
 			reused: Boolean(saved),
-			close() {
+			async close() {
 				try {
-					connection.close();
+					await connection.close();
 				} finally {
 					lock.close();
 				}
@@ -138,7 +139,7 @@ export async function prepareCorpusBuild(
 		};
 	} catch (error) {
 		try {
-			db?.close();
+			await db?.close();
 		} finally {
 			lock.close();
 		}

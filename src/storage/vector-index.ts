@@ -1,11 +1,15 @@
 import type { DatabaseSync } from "node:sqlite";
 import { load } from "sqlite-vec";
+import type { Database } from "./database.ts";
 import { rowToHit } from "./retrieval-row.ts";
 import type { RetrievalHit } from "../retrieval/core/types.ts";
 import type { EmbeddingProvider } from "../models/embedding/provider.ts";
 import type { PendingEmbedding, VectorIndexStatus } from "./vector-types.ts";
 
 const loadedConnections = new WeakSet<DatabaseSync>();
+const VECTOR_SEARCH_SQL = `SELECT u.*, 1 - vec_distance_cosine(e.vector, ?) AS score
+	FROM embeddings e JOIN retrieval_units u ON u.source_type = e.source_type AND u.unit_id = e.unit_id
+	WHERE u.source_type = ? ORDER BY score DESC, u.source_id, u.chunk_index LIMIT ?`;
 
 /**
  * Persistent float32 vectors with sqlite-vec cosine retrieval. Uses an exact scan over the source's
@@ -13,12 +17,12 @@ const loadedConnections = new WeakSet<DatabaseSync>();
  * The caller owns the connection; HTTP calls never hold a write transaction.
  */
 export class VectorIndex {
-	private readonly db: DatabaseSync;
+	private readonly db: Database;
 	private readonly provider: EmbeddingProvider;
 	private readonly batchSize: number;
 	private pendingSync: Promise<void> = Promise.resolve();
 
-	constructor(db: DatabaseSync, provider: EmbeddingProvider, batchSize = 32) {
+	constructor(db: Database, provider: EmbeddingProvider, batchSize = 32) {
 		if (!Number.isSafeInteger(batchSize) || batchSize < 1) throw new Error("Embedding batchSize must be positive.");
 		if (!Number.isSafeInteger(provider.dimensions) || provider.dimensions < 1 || !provider.identity)
 			throw new Error("Invalid embedding configuration.");
@@ -102,15 +106,44 @@ export class VectorIndex {
 			throw new Error(`Vector index is incomplete: ${status.pending}/${status.total} ${source} units pending.`);
 	}
 
+	/** Configuration writes stay on the owner connection; readiness reads run on a worker. */
+	async assertReadyAsync(source: RetrievalHit["sourceType"], provider: EmbeddingProvider): Promise<void> {
+		this.db
+			.prepare("INSERT OR IGNORE INTO embedding_config VALUES (1, ?, ?)")
+			.run(this.provider.identity, this.provider.dimensions);
+		const [config] = await this.db.executor.execute({
+			sql: `SELECT c.identity, c.dimensions, count(u.unit_id) - count(e.unit_id) AS pending,
+				count(u.unit_id) AS total FROM embedding_config c
+				LEFT JOIN retrieval_units u ON u.source_type = ?
+				LEFT JOIN embeddings e ON e.source_type = u.source_type AND e.unit_id = u.unit_id
+				WHERE c.id = 1 GROUP BY c.identity, c.dimensions`,
+			parameters: [source],
+		});
+		if (config?.identity !== provider.identity || Number(config?.dimensions) !== provider.dimensions)
+			throw new Error("Embedding configuration differs from the index; explicitly rebuild vectors before use.");
+		if (Number(config.pending))
+			throw new Error(`Vector index is incomplete: ${config.pending}/${config.total} ${source} units pending.`);
+	}
+
+	/** Asynchronous retrieval uses the database-owned executor, never a model inside a worker. */
+	async searchAsync(source: RetrievalHit["sourceType"], vector: readonly number[], topK: number): Promise<RetrievalHit[]> {
+		await this.assertReadyAsync(source, this.provider);
+		if (!Number.isSafeInteger(topK) || topK < 1) return [];
+		const rows = await this.db.executor.execute({
+			sql: VECTOR_SEARCH_SQL,
+			parameters: [this.encodeVector(vector), source, topK],
+			vector: true,
+		});
+		return rows.map(rowToHit);
+	}
+
 	/** Return cosine similarity (1 - distance), descending, with the same source coordinates as BM25. */
 	search(source: RetrievalHit["sourceType"], vector: readonly number[], topK: number): RetrievalHit[] {
 		this.assertReady(source, this.provider);
 		if (!Number.isSafeInteger(topK) || topK < 1) return [];
 		const blob = this.encodeVector(vector);
 		return this.db
-			.prepare(`SELECT u.*, 1 - vec_distance_cosine(e.vector, ?) AS score
-			FROM embeddings e JOIN retrieval_units u ON u.source_type = e.source_type AND u.unit_id = e.unit_id
-			WHERE u.source_type = ? ORDER BY score DESC, u.source_id, u.chunk_index LIMIT ?`)
+			.prepare(VECTOR_SEARCH_SQL)
 			.all(blob, source, topK)
 			.map(rowToHit);
 	}

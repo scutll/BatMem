@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../src/storage/database.ts";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { openDatabase } from "../../src/storage/database.ts";
 import type { EmbeddingProvider } from "../../src/models/embedding/provider.ts";
@@ -13,7 +13,7 @@ const identity = "test/fixed-2d:retrieval.passage/retrieval.query:v1";
 
 describe("vector index", () => {
 	let directory: string;
-	let db: DatabaseSync;
+	let db: Database;
 
 	beforeEach(async () => {
 		directory = await mkdtemp(join(tmpdir(), "batmem-vector-"));
@@ -21,7 +21,7 @@ describe("vector index", () => {
 	});
 
 	afterEach(async () => {
-		db?.close();
+		await db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
 
@@ -231,7 +231,7 @@ describe("vector index", () => {
 		let index = new VectorIndex(db, provider);
 		index.initialize();
 		await index.syncEmbeddings("document");
-		db.close();
+		await db.close();
 		db = openDatabase(join(directory, "index.db"));
 		index = new VectorIndex(db, provider);
 		index.initialize();

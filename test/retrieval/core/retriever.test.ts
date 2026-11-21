@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../../src/storage/database.ts";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import type { EmbeddingProvider } from "../../../src/models/embedding/provider.ts";
 import { VectorIndex } from "../../../src/storage/vector-index.ts";
@@ -30,7 +30,7 @@ function hit(sourceId: string, score: number): RetrievalHit {
 
 describe("search services", () => {
 	let directory: string;
-	let db: DatabaseSync;
+	let db: Database;
 
 	beforeEach(async () => {
 		directory = await mkdtemp(join(tmpdir(), "batmem-search-"));
@@ -38,7 +38,7 @@ describe("search services", () => {
 	});
 
 	afterEach(async () => {
-		db?.close();
+		await db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
 

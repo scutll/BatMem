@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../storage/database.ts";
 import { createRetriever } from "../retrieval/create-retriever.ts";
 import type { RetrievalOptions, RetrievalQuery, QueryRetriever } from "../retrieval/core/types.ts";
 import { chunkMarkdown } from "./chunker.ts";
@@ -9,11 +9,11 @@ import type { DocumentChunk, DocumentRecord, DocumentRetrievalHit, RAGServiceOpt
 
 /** Local Markdown indexing and chunk retrieval. Source files are read, never modified. */
 export class RAGService {
-	private readonly db: DatabaseSync;
+	private readonly db: Database;
 	private readonly documentsDirectory: string;
 	private readonly search: QueryRetriever;
 	/** Use a caller-owned initialized connection and one scan root; the root must exist when scanning. */
-	constructor(db: DatabaseSync, documentsDirectory: string, options: RAGServiceOptions = {}) {
+	constructor(db: Database, documentsDirectory: string, options: RAGServiceOptions = {}) {
 		this.db = db;
 		this.documentsDirectory = resolve(documentsDirectory);
 		this.search = options.search ?? createRetriever(db, "document");

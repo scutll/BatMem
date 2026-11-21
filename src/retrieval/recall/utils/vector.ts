@@ -15,11 +15,10 @@ export class VectorRetriever implements RecallSource {
 	}
 
 	async retrieve({ query, topK }: RetrievalQuery): Promise<RetrievalHit[]> {
-		this.index.assertReady(this.source, this.provider);
+		await this.index.assertReadyAsync(this.source, this.provider);
 		if (!query.trim() || !Number.isSafeInteger(topK) || topK < 1) return [];
 		const vector = await this.provider.embedQuery(query);
 		// Recheck readiness after HTTP: another session may have changed the corpus in the meantime.
-		this.index.assertReady(this.source, this.provider);
-		return this.index.search(this.source, vector, topK);
+		return this.index.searchAsync(this.source, vector, topK);
 	}
 }

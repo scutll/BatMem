@@ -146,6 +146,9 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 		const implementationHashes: Record<string, string> = {};
 		const implementations = [
 			"../../../src/storage/database.ts",
+			"../../../src/storage/query-executor.ts",
+			"../../../src/storage/query-executor-types.ts",
+			"../../../src/storage/query-worker.ts",
 			"../../../src/documents/service.ts",
 			"../../../src/documents/chunker.ts",
 			"../../../src/documents/types.ts",
@@ -226,6 +229,6 @@ export async function runRetrievalEval(options: RetrievalEvalOptions): Promise<v
 		);
 		console.info(`[评测完成] ${queries.length} 条查询；结果：${join(output, "retrieval.jsonl")}`);
 	} finally {
-		build.close();
+		await build.close();
 	}
 }

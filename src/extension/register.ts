@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../storage/database.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createEmbeddingProvider, createRerankingProvider } from "../models/create-providers.ts";
@@ -33,7 +33,7 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 	let activeStrategy = initialStrategy;
 	selectRetrievalOptions(initialStrategy, strategies);
 	const evalMode = options.evalMode ?? false;
-	let db: DatabaseSync | undefined;
+	let db: Database | undefined;
 	let memory: MemoryService | undefined;
 	let rag: RAGService | undefined;
 	let documentVectors: VectorIndex | undefined;
@@ -50,7 +50,7 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 		await Promise.all([scan, pendingSummary]);
 		await ownedProvider?.close();
 		await ownedReranker?.close();
-		db?.close();
+		await db?.close();
 		candidate = undefined;
 		const directory = join(ctx.sessionManager.getCwd(), ".pi", "docs-memory");
 		const documents = join(directory, "documents");
@@ -139,7 +139,7 @@ export default function registerExtension(pi: ExtensionAPI, options: BatMemOptio
 		ownedReranker = undefined;
 		ownedProvider = undefined;
 		provider = undefined;
-		db?.close();
+		await db?.close();
 		db = undefined;
 		memory = undefined;
 		rag = undefined;

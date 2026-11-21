@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../storage/database.ts";
 import type { EmbeddingProvider } from "../models/embedding/provider.ts";
 import { VectorIndex } from "../storage/vector-index.ts";
 import type { RerankingProvider } from "../models/reranking/provider.ts";
@@ -9,7 +9,7 @@ import { VectorRetriever } from "./recall/utils/vector.ts";
 
 /** Bind retrievers to one connection and source. No indexing or provider allocation. */
 export function createRetriever(
-	db: DatabaseSync,
+	db: Database,
 	sourceType: RetrievalHit["sourceType"],
 	embedding?: EmbeddingProvider,
 	reranker?: RerankingProvider,

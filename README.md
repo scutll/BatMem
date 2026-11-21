@@ -166,6 +166,10 @@ DEEPSEEK_API_KEY=your-deepseek-api-key
 
 四条路径并发执行，其中三条调用模型。全部成功后进入 Processor；任一路失败会等待其余路径结束再报错。当前每路召回数量使用请求的 `topK`；需要扩大融合候选池时，可在各路 `run()` 内单独设置数量。
 
+文件数据库由 `db.executor` 调度 BM25 和向量 SQL 查询。Worker 按查询需求启动，默认最多 4 个，每个持有独立的只读 SQLite 连接并持续复用；超出容量的查询排队。各路可共用同一个 BM25 或 Vector Retriever，`retrieve()` 接口不变。completion、embedding 模型请求和数据库写入仍在原调用位置执行。WAL 允许查询连接与写连接并存，各路查询读取各自执行时的已提交数据。
+
+直接使用数据库时，可通过 `openDatabase(path, { workers: 2 })` 设置并行上限，结束后执行 `await db.close()`，等待已接收查询完成并释放 Worker。纯索引构建不会启动查询线程。`:memory:` 是单连接私有数据库，其检索保留在当前线程执行。
+
 该策略按结果身份去重，以 `1 / (60 + rank)` 累加各路排名贡献，再按融合分数降序返回。Memory 的身份为 Session ID，Document 的身份为文档 ID 与 Chunk Index。
 
 增加路径时，将任务加入 `ParallelRecall` 数组，并同步更新 `metadata.recallPaths`。需要向量的组合设置 `requiresEmbedding: true`，并在 `createRecall` 中校验 `vector` 存在。
@@ -315,6 +319,9 @@ BatMem/
 │   │   └── create-providers.ts          # Jina 配置与实例创建
 │   └── storage/
 │       ├── database.ts
+│       ├── query-executor.ts            # SQLite 查询调度
+│       ├── query-executor-types.ts
+│       ├── query-worker.ts              # 独立只读连接
 │       ├── vector-index.ts
 │       ├── vector-types.ts
 │       └── retrieval-row.ts

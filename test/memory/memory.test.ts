@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../src/storage/database.ts";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { EmbeddingProvider } from "../../src/models/embedding/provider.ts";
@@ -67,7 +67,7 @@ function createConversation(): SessionEntry[] {
 
 describe("cross-session memory", () => {
 	let directory: string;
-	let db: DatabaseSync;
+	let db: Database;
 	let memory: MemoryService;
 
 	beforeEach(async () => {
@@ -77,7 +77,7 @@ describe("cross-session memory", () => {
 	});
 
 	afterEach(async () => {
-		db?.close();
+		await db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
 
@@ -331,7 +331,7 @@ describe("cross-session memory", () => {
 			createSessionSnapshot([createUserMessage("u1", null, "quasar")]),
 			async () => "quasar persisted",
 		);
-		db.close();
+		await db.close();
 		db = openDatabase(join(directory, "nested", "index.db"));
 		memory = new MemoryService(db);
 		assert.equal(

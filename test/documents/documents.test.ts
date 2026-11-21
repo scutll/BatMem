@@ -14,7 +14,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../../src/storage/database.ts";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { RAGService } from "../../src/documents/service.ts";
@@ -24,7 +24,7 @@ import { openDatabase } from "../../src/storage/database.ts";
 describe("Markdown retrieval", () => {
 	let directory: string;
 	let documents: string;
-	let db: DatabaseSync;
+	let db: Database;
 	let rag: RAGService;
 	let fixturePath: string;
 
@@ -51,7 +51,7 @@ describe("Markdown retrieval", () => {
 	});
 
 	afterEach(async () => {
-		db?.close();
+		await db?.close();
 		await rm(directory, { recursive: true, force: true });
 	});
 
@@ -179,7 +179,7 @@ describe("Markdown retrieval", () => {
 	it("retains indexed documents after the database is reopened", async () => {
 		await appendFile(fixturePath, "\nbatmemtestquasar batmemtestpersisted\n");
 		await rag.scanDocuments();
-		db.close();
+		await db.close();
 		db = openDatabase(join(directory, "index.db"));
 		rag = new RAGService(db, documents);
 		assert.match(

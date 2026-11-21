@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Database } from "../storage/database.ts";
 import { VectorIndex } from "../storage/vector-index.ts";
 import { createRetriever } from "../retrieval/create-retriever.ts";
 import type { RetrievalHit, RetrievalOptions, RetrievalQuery, QueryRetriever } from "../retrieval/core/types.ts";
@@ -12,13 +12,13 @@ import type {
 
 /** Session indexing and retrieval independent of extension events and concrete model providers. */
 export class MemoryService {
-	private readonly db: DatabaseSync;
+	private readonly db: Database;
 	private readonly vectors?: VectorIndex;
 	private readonly search: QueryRetriever;
 	/** Existing summaries are checked for missing vectors as soon as the service opens. */
 	readonly ready: Promise<void>;
 	/** Use a caller-owned database; an optional provider enables summary vectors and vsearch. */
-	constructor(db: DatabaseSync, options: MemoryServiceOptions = {}) {
+	constructor(db: Database, options: MemoryServiceOptions = {}) {
 		this.db = db;
 		this.vectors = options.embedding ? new VectorIndex(db, options.embedding) : undefined;
 		this.search = options.search ?? createRetriever(db, "memory", options.embedding);
